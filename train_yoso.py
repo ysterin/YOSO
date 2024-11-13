@@ -35,7 +35,7 @@ from peft import LoraConfig, get_peft_model, get_peft_model_state_dict
 
 from unet import UNet2DConditionModel
 import diffusers
-from diffusers import AutoencoderKL, DDPMScheduler, StableDiffusionPipeline
+from diffusers import AutoencoderKL, DDPMScheduler, StableDiffusionPipeline, EMAModel
 from diffusers.optimization import get_scheduler
 from diffusers.utils import check_min_version, deprecate, is_wandb_available
 from diffusers.utils.import_utils import is_xformers_available
@@ -547,39 +547,41 @@ def main():
     text_encoder.requires_grad_(False)
     unet.train()
     unet_gan.train()
-    lora_config = LoraConfig(
-        r=64,
-        target_modules=[
-            "to_q",
-            "to_k",
-            "to_v",
-            "to_out.0",
-            "proj_in",
-            "proj_out",
-            "ff.net.0.proj",
-            "ff.net.2",
-            "conv1",
-            "conv2",
-            "conv_shortcut",
-            "downsamplers.0.conv",
-            "upsamplers.0.conv",
-            "time_emb_proj",
-        ],
-    )
-    unet = get_peft_model(unet, lora_config)
+    # lora_config = LoraConfig(
+    #     r=64,
+    #     target_modules=[
+    #         "to_q",
+    #         "to_k",
+    #         "to_v",
+    #         "to_out.0",
+    #         "proj_in",
+    #         "proj_out",
+    #         "ff.net.0.proj",
+    #         "ff.net.2",
+    #         "conv1",
+    #         "conv2",
+    #         "conv_shortcut",
+    #         "downsamplers.0.conv",
+    #         "upsamplers.0.conv",
+    #         "time_emb_proj",
+    #     ],
+    # )
+    # unet = get_peft_model(unet, lora_config)
     # ema_lora_state_dict =  get_peft_model_state_dict(unet_, adapter_name="default")
     # unet_gan.unet = get_peft_model(unet_gan.unet, lora_config)
     from copy import deepcopy
     # Create EMA for the unet.
     if args.use_ema:
         # dic_lora = get_peft_model_state_dict(unet, adapter_name="default")
-        dic_lora = get_module_kohya_state_dict(unet, "lora_unet", torch.float32)
-        ema_dic_lora = deepcopy(dic_lora)
+        # dic_lora = get_module_kohya_state_dict(unet, "lora_unet", torch.float32)
+        # ema_dic_lora = deepcopy(dic_lora)
         # ema_unet = UNet2DConditionModel.from_pretrained(
         #     args.pretrained_model_name_or_path, subfolder="unet", revision=args.revision, variant=args.variant
         # )
-        # ema_unet = deepcopy(unet)
-        # ema_unet = EMAModel(ema_unet.parameters(), model_cls=UNet2DConditionModel, model_config=ema_unet.config)
+        ema_unet = deepcopy(unet)
+        ema_unet = EMAModel(ema_unet.parameters(), model_cls=UNet2DConditionModel, model_config=ema_unet.config,
+                            decay=0.999)
+        # ema_unet = accelerator.prepare_model(ema_unet)
 
     if args.enable_xformers_memory_efficient_attention:
         if is_xformers_available():
@@ -601,11 +603,12 @@ def main():
         def save_model_hook(models, weights, output_dir):
             if accelerator.is_main_process:
                 unet_ = accelerator.unwrap_model(unet)
-                lora_state_dict = get_peft_model_state_dict(unet_, adapter_name="default")
-                StableDiffusionPipeline.save_lora_weights(os.path.join(output_dir, "unet_lora"), lora_state_dict)
-                unet_.save_pretrained(os.path.join(output_dir, "unet"))
+                unet_.save_adapter(os.path.join(output_dir, "unet"), "default")
+                # lora_state_dict = get_peft_model_state_dict(unet_, adapter_name="default")
+                # StableDiffusionPipeline.save_lora_weights(os.path.join(output_dir, "unet_lora"), lora_state_dict)
+                # unet_.save_pretrained(os.path.join(output_dir, "unet"))
 
-                torch.save(ema_dic_lora, os.path.join(output_dir, 'ema_lora.pt'))
+                # torch.save(ema_dic_lora, os.path.join(output_dir, 'ema_lora.pt'))
                 # ema_dic_lora
                 # ema_lora_state_dict = get_peft_model_state_dict(unet_, adapter_name="default")
                 # StableDiffusionPipeline.save_lora_weights(os.path.join(output_dir, "unet_lora_ema"), ema_lora_state_dict)
@@ -684,8 +687,7 @@ def main():
     optimizer_d = optimizer_cls(
         unet_gan.parameters(),
         lr=args.learning_rate,
-        # betas=(0., args.adam_beta2),
-        betas=(args.adam_beta1, args.adam_beta2),
+        betas=(0., args.adam_beta2),
         weight_decay=args.adam_weight_decay,
         eps=args.adam_epsilon,
     )
@@ -966,7 +968,6 @@ def main():
                 accelerator.backward(D_final_loss)
 
                 wandb.log({"D_real": D_real, "D_fake": D_fake, "D_final_loss": D_final_loss,
-                           "lr": lr_scheduler.get_last_lr()[0],
                            "errD": errD, "errD_real": errD_real, "errD_fake": errD_fake}, step=step)
 
                 avg_real_loss = accelerator.gather(D_real.repeat(args.train_batch_size)).mean()
@@ -1079,7 +1080,6 @@ def main():
                         images_pervt = vae.decode(target.to(vae.dtype) / vae.config.scaling_factor, return_dict=False)[
                             0]
                         pure_noisy = noise_scheduler.add_noise(latents, noise, T_)
-
                         noise_pred = unet(pure_noisy, T_,
                                           encoder_hidden_states, return_dict=False)[0]
                         noise_generation = predicted_origin(
@@ -1117,11 +1117,13 @@ def main():
             if accelerator.sync_gradients:
                 if args.use_ema:
                     decay = 0.999
-                    unet_ = accelerator.unwrap_model(unet)
-                    dic_lora = get_module_kohya_state_dict(unet_, "lora_unet", torch.float32)
-                    for k, v in dic_lora.items():
-                        ema_dic_lora[k] = decay * deepcopy(ema_dic_lora[k]).to(v.device) + (1 - decay) * (deepcopy(v))
-                    # ema_unet.step(unet.parameters())
+                    # unet_ = accelerator.unwrap_model(unet)
+                    # for k, v in unet.named_parameters():
+                    #     ema_unet[k] = decay * deepcopy(ema_unet[k]).to(v.device) + (1 - decay) * (deepcopy(v))
+                    # dic_lora = get_module_kohya_state_dict(unet_, "lora_unet", torch.float32)
+                    # for k, v in dic_lora.items():
+                        # ema_dic_lora[k] = decay * deepcopy(ema_dic_lora[k]).to(v.device) + (1 - decay) * (deepcopy(v))
+                    ema_unet.step(unet.parameters())
                 progress_bar.update(1)
                 global_step += 1
                 accelerator.log({"train_loss": train_loss, "d_real": train_d_real, "d_fake": train_d_fake},

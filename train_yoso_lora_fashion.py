@@ -14,19 +14,25 @@
 # See the License for the specific language governing permissions and
 
 import argparse
+import glob
 import logging
 import os
 import shutil
 from pathlib import Path
 import accelerate
 import datasets
+import numpy as np
 import transformers
+from PIL import Image, ImageOps
 from accelerate import Accelerator
 from accelerate.logging import get_logger
 from accelerate.state import AcceleratorState
 from accelerate.utils import ProjectConfiguration, set_seed
 from huggingface_hub import create_repo
 from packaging import version
+from safetensors import safe_open
+from torch.nn.parallel import DistributedDataParallel
+from torchvision import transforms
 from torchvision.utils import save_image
 from tqdm.auto import tqdm
 from transformers import CLIPTextModel, CLIPTokenizer
@@ -35,7 +41,7 @@ from peft import LoraConfig, get_peft_model, get_peft_model_state_dict
 
 from unet import UNet2DConditionModel
 import diffusers
-from diffusers import AutoencoderKL, DDPMScheduler, StableDiffusionPipeline
+from diffusers import AutoencoderKL, DDPMScheduler, StableDiffusionPipeline, DDIMScheduler, LCMScheduler
 from diffusers.optimization import get_scheduler
 from diffusers.utils import check_min_version, deprecate, is_wandb_available
 from diffusers.utils.import_utils import is_xformers_available
@@ -363,6 +369,16 @@ def parse_args():
         ),
     )
     parser.add_argument(
+        "--start_from_checkpoint",
+        type=str,
+        default=None,
+        help=(
+            "Whether training should be started from a specific checkpoint. Use a path saved by"
+            ' `--checkpointing_steps`.'
+        ),
+    )
+
+    parser.add_argument(
         "--enable_xformers_memory_efficient_attention", action="store_true", help="Whether or not to use xformers."
     )
     parser.add_argument("--noise_offset", type=float, default=0, help="The scale of noise offset.")
@@ -387,6 +403,17 @@ def parse_args():
         type=str,
         default=None,
         help="api",
+    )
+    parser.add_argument(
+        "--zero_terminal_snr",
+        action="store_true",
+        help="Whether to zero the terminal SNR.",
+    )
+    parser.add_argument(
+        "--adaptive_annealing_steps",
+        type=int,
+        default=0,
+        help="Number of steps for adaptive annealing.",
     )
 
     # args = parser.parse_args()
@@ -415,6 +442,11 @@ def extract_into_tensor(a, t, x_shape):
 def main():
     args = parse_args()
 
+    data_path = os.getenv("DATA_PATH", "/mnt/data")
+    artifacts_path = os.getenv("ARTIFACTS_PATH", "/mnt/artifacts")
+
+    if args.output_dir.startswith("/artifacts/"):
+        args.output_dir = os.path.join(artifacts_path, "/".join(args.output_dir.split("/")[2:]))
 
     if args.non_ema_revision is not None:
         deprecate(
@@ -461,7 +493,16 @@ def main():
         os.environ['WANDB_API_KEY'] = os.environ.get('WANDB_API_KEY', args.wandb)
         wandb.login(key=args.wandb)
 
-    wandb.init(project=args.tracker_project_name, config=args)
+    # if accelerator.is_main_process:
+    #     if os.path.exists(os.path.join(args.output_dir, "wandb_run_id.txt")):
+    #         with open(os.path.join(args.output_dir, "wandb_run_id.txt"), "r") as f:
+    #             wandb_run_id = f.read()
+    #         wandb.init(project=args.tracker_project_name, id=wandb_run_id, resume="must")
+    #     else:
+    #         wandb.init(project=args.tracker_project_name, config=args)
+    #         os.makedirs(args.output_dir, exist_ok=True)
+    #         with open(os.path.join(args.output_dir, "wandb_run_id.txt"), "w") as f:
+    #             f.write(wandb.run.id)
 
     # Handle the repository creation
     if accelerator.is_main_process:
@@ -474,7 +515,31 @@ def main():
             ).repo_id
 
     # Load scheduler, tokenizer and models.
-    noise_scheduler = DDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
+
+    # noise_scheduler = DDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler",
+    #                                                 prediction_type=args.prediction_type,
+    #                                                 rescale_betas_zero_snr=args.zero_terminal_snr)
+    # noise_scheduler = DDIMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler",
+    #                                                 timestep_spacing="trailing",
+    #                                                 rescale_betas_zero_snr=args.zero_terminal_snr,
+    #                                                 prediction_type=args.prediction_type)
+    noise_scheduler = LCMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler",
+                                                    timestep_spacing="trailing",
+                                                    rescale_betas_zero_snr=args.zero_terminal_snr,
+                                                    prediction_type=args.prediction_type)
+
+
+    # if args.prediction_type is not None:
+    #     # set prediction_type of scheduler if defined
+    #     noise_scheduler.register_to_config(prediction_type=args.prediction_type)
+
+    # if args.zero_terminal_snr:
+    #     noise_scheduler.register_to_config(rescale_betas_zero_snr=True)
+    #     alpha_schedule = torch.sqrt(noise_scheduler.alphas_cumprod.clone())
+    #     alpha_0, alpha_T = alpha_schedule[0], alpha_schedule[-1]
+    #     alpha_schedule = alpha_schedule.clone() - alpha_T
+    #     alpha_schedule = alpha_schedule *  alpha_0 / (alpha_0 - alpha_T)
+    #     noise_scheduler.alphas_cumprod = alpha_schedule ** 2
     alpha_schedule = torch.sqrt(noise_scheduler.alphas_cumprod)
     sigma_schedule = torch.sqrt(1 - noise_scheduler.alphas_cumprod)
     tokenizer = CLIPTokenizer.from_pretrained(
@@ -510,8 +575,12 @@ def main():
             args.pretrained_model_name_or_path, subfolder="vae", revision=args.revision, variant=args.variant
         )
 
+    if args.start_from_checkpoint is not None and args.start_from_checkpoint.startswith("/artifacts"):
+        args.start_from_checkpoint = os.path.join(artifacts_path, "/".join(args.start_from_checkpoint.split("/")[2:]))
+
     unet = UNet2DConditionModel.from_pretrained(
-        args.pretrained_model_name_or_path, subfolder="unet", revision=args.revision, variant=args.variant
+        args.pretrained_model_name_or_path,
+        subfolder="unet", revision=args.revision, variant=args.variant
     )
     from diffusers.models import ModelMixin
     from diffusers.configuration_utils import ConfigMixin
@@ -519,13 +588,15 @@ def main():
         def __init__(self):
             super(My_Dis, self).__init__()
             self.unet = UNet2DConditionModel.from_pretrained(
-                "runwayml/stable-diffusion-v1-5", subfolder="unet", revision=args.revision, variant=args.variant
+                # "runwayml/stable-diffusion-v1-5", subfolder="unet", revision=args.revision, variant=args.variant
+                args.pretrained_model_name_or_path, subfolder="unet", revision=args.revision, variant=args.variant
+
             )
             self.out_head = nn.ModuleList([
                 normalization(1280),
                 nn.SiLU(),
                 AttentionPool2d(
-                    (8), 1280, 16, 512),
+                    (args.resolution // 64), 1280, 16, 512),
                 nn.SiLU(),
                 nn.Linear(512, 1),
             ])
@@ -566,7 +637,43 @@ def main():
             "time_emb_proj",
         ],
     )
+    # unet.load_attn_procs(
+    #     "/mnt/artifacts/yoso/tmp/sd-2-1-checkpoint-adapt-ztsnr/checkpoint-42000/unet_lora/pytorch_lora_weights.safetensors")
     unet = get_peft_model(unet, lora_config)
+    if args.start_from_checkpoint is not None:
+        # if args.start_from_checkpoint.startswith("/artifacts/"):
+        #     args.start_from_checkpoint = os.path.join(artifacts_path,
+        #                                               "/".join(args.start_from_checkpoint.split("/")[2:]))
+
+        state_dict = {}
+        with safe_open(args.start_from_checkpoint, framework="pt", device=0) as f:
+            for k in f.keys():
+                state_dict[k] = f.get_tensor(k)
+
+        def adapt_state_dict(sd):
+            new_state_dict = {}
+            for k, v in sd.items():
+                new_k = ".".join(k.split(".")[:-1] + ['default'] + k.split(".")[-1:])
+                new_state_dict[new_k] = v
+            return new_state_dict
+
+        state_dict = adapt_state_dict(state_dict)
+
+        # Load only the LoRA weights
+        missing_keys, unexpected_keys = unet.load_state_dict(
+            state_dict,
+            strict=False
+        )
+        print(f"Loaded checkpoint from {args.start_from_checkpoint}")
+        print(f"Missing keys: {missing_keys}")
+        print(f"Unexpected keys: {unexpected_keys}")
+        print(f"len(missing_keys): {len(missing_keys)}")
+        print(f"first 10 missing keys: {missing_keys[:10]}")
+        print(f"len(unexpected_keys): {len(unexpected_keys)}")
+        print(f"first 10 unexpected keys: {unexpected_keys[:10]}")
+        print(f"Loaded checkpoint from {args.start_from_checkpoint}")
+        # unet.load_adapter(args.start_from_checkpoint, "default", is_trainable=True)
+
     # ema_lora_state_dict =  get_peft_model_state_dict(unet_, adapter_name="default")
     # unet_gan.unet = get_peft_model(unet_gan.unet, lora_config)
     from copy import deepcopy
@@ -610,8 +717,8 @@ def main():
                 # ema_lora_state_dict = get_peft_model_state_dict(unet_, adapter_name="default")
                 # StableDiffusionPipeline.save_lora_weights(os.path.join(output_dir, "unet_lora_ema"), ema_lora_state_dict)
                 # ema_unet.save_pretrained(os.path.join(output_dir, "unet"))
-                # unet_gan_ = accelerator.unwrap_model(unet_gan)
-                # unet_gan_.save_pretrained(os.path.join(output_dir, "unet_GAN"))
+                unet_gan_ = accelerator.unwrap_model(unet_gan)
+                unet_gan_.save_pretrained(os.path.join(output_dir, "unet_GAN"))
 
                 for i, model in enumerate(models):
                     weights.pop()
@@ -628,22 +735,24 @@ def main():
             for i in range(len(models)):
                 # pop models so that they are not loaded again
                 model = models.pop()
-            #     if isinstance(model, My_Dis):
-            #         # save_pth_ = os.path.join(output_dir, "unetGAN")
-            #         # checkpoint = torch.load(os.path.join('unet_gan.pth'))
-            #         # model.load_state_dict(checkpoint)
-            #         load_model = My_Dis.from_pretrained(input_dir, subfolder="unetGAN")
-            #         model.register_to_config(**load_model.config)
-            #         model.load_state_dict(load_model.state_dict())
-            #         del load_model
-            #     else:
-            #         # load diffusers style into model
-            #         load_model = UNet2DConditionModel.from_pretrained(input_dir, subfolder="unet")
-            #         model.register_to_config(**load_model.config)
-
-            #         model.load_state_dict(load_model.state_dict())
-            #         del load_model
-
+                if isinstance(model, My_Dis):
+                    # save_pth_ = os.path.join(output_dir, "unetGAN")
+                    # checkpoint = torch.load(os.path.join('unet_gan.pth'))
+                    # model.load_state_dict(checkpoint)
+                    load_model = My_Dis.from_pretrained(input_dir, subfolder="unet_GAN")
+                    # load_model = My_Dis.from_pretrained(os.path.join(input_dir, "unet_GAN"))
+                    model.register_to_config(**load_model.config)
+                    model.load_state_dict(load_model.state_dict())
+                    # dis_checkpoint_path = os.path.join(input_dir, "unet_GAN", "")
+                    del load_model
+                # else:
+                #     # load diffusers style into model
+                #     load_model = UNet2DConditionModel.from_pretrained(input_dir, subfolder="unet")
+                #     model.register_to_config(**load_model.config)
+                #
+                #     model.load_state_dict(load_model.state_dict())
+                #     del load_model
+                #
         accelerator.register_save_state_pre_hook(save_model_hook)
         accelerator.register_load_state_pre_hook(load_model_hook)
 
@@ -684,8 +793,7 @@ def main():
     optimizer_d = optimizer_cls(
         unet_gan.parameters(),
         lr=args.learning_rate,
-        # betas=(0., args.adam_beta2),
-        betas=(args.adam_beta1, args.adam_beta2),
+        betas=(0., args.adam_beta2),
         weight_decay=args.adam_weight_decay,
         eps=args.adam_epsilon,
     )
@@ -698,32 +806,85 @@ def main():
     import torch
     from torch.utils.data import Dataset
 
-    data_path = os.getenv("DATA_PATH", "/mnt/data")
-    artifacts_path = os.getenv("ARTIFACTS_PATH", "/mnt/artifacts")
+    # class CustomImagePromptDataset(Dataset):
+    #     def __init__(self, jsonl_file, transform=None):
+    #         self.data = []
+    #         self.transform = transform
+    #         self.tokenizer = CLIPTokenizer.from_pretrained(
+    #             'runwayml/stable-diffusion-v1-5', subfolder="tokenizer", )
+    #         with open(jsonl_file, 'r') as file:
+    #             for line in file:
+    #                 entry = json.loads(line)
+    #                 self.data.append(entry['prompt'])
+    #
+    #     def __len__(self):
+    #         return len(self.data)
+    #
+    #     def __getitem__(self, idx):
+    #         text = self.data[idx]
+    #         prompt = self.tokenizer([text], max_length=self.tokenizer.model_max_length, padding="max_length",
+    #                                 truncation=True, return_tensors="pt").input_ids
+    #         return text, prompt
 
     class CustomImagePromptDataset(Dataset):
-        def __init__(self, jsonl_file, transform=None):
-            self.data = []
+        def __init__(self, root_dir, frames_dirname="frames", annots_file_name="txts_flash_yoso.json", transform=None):
+            # self.data = []
             self.transform = transform
             self.tokenizer = CLIPTokenizer.from_pretrained(
                 'runwayml/stable-diffusion-v1-5', subfolder="tokenizer", )
-            with open(jsonl_file, 'r') as file:
-                for line in file:
-                    entry = json.loads(line)
-                    self.data.append(entry['prompt'])
+            self.root_dir = root_dir
+            # self.subdirs = [d for d in os.listdir(root_dir) if os.path.isdir(os.path.join(root_dir, d)) and
+            #                 os.path.isfile(os.path.join(root_dir, d, annots_file_name))]
+            self.annots_files = glob.glob(os.path.join(root_dir, "*", annots_file_name))
+            self.file_paths = []
+            self.annots_dict = {}
+            for annots_file in self.annots_files:
+                folder_name = os.path.basename(os.path.dirname(annots_file))
+                with open(annots_file, 'r') as file:
+                    annots = json.load(file)
+                    for k, v in annots.items():
+                        file_path = os.path.join(root_dir, folder_name, frames_dirname, k)
+                        annot = v[0]["11"]
+                        if not isinstance(annot, str):
+                            continue
+                        self.annots_dict[file_path] = annot
+                        self.file_paths.append(file_path)
+
+            # with open(jsonl_file, 'r') as file:
+            #     for line in file:
+            #         entry = json.loads(line)
+            #         self.data.append(entry['prompt'])
 
         def __len__(self):
-            return len(self.data)
+            return len(self.file_paths)
 
         def __getitem__(self, idx):
-            text = self.data[idx]
+            file_path = self.file_paths[idx]
+            text = self.annots_dict[file_path]
             prompt = self.tokenizer([text], max_length=self.tokenizer.model_max_length, padding="max_length",
                                     truncation=True, return_tensors="pt").input_ids
-            return text, prompt
+            image = Image.open(file_path).convert('RGB')
+            image = ImageOps.pad(image, (args.resolution, args.resolution))
+            if self.transform:
+                image = self.transform(image)
+            # image = torch.tensor(np.array(image)).permute(2, 0, 1)
+            # image = (image.float() / 255.0) * 2.0 - 1.0
+
+            return text, prompt, image
 
     # Create Dataset
-    dataset = CustomImagePromptDataset(jsonl_file=os.path.join(data_path, 'YOSO/train_anno.jsonl'), transform=None)
+    # dataset = CustomImagePromptDataset(jsonl_file=os.path.join(data_path, 'YOSO/train_anno.jsonl'), transform=None)
     # dataset = CustomImagePromptDataset(jsonl_file='./train_anno.jsonl', transform=None)
+    transform = transforms.Compose([
+        transforms.Resize((args.resolution, args.resolution)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
+    ])
+    # dataset = CustomImagePromptDataset(root_dir=f"{data_path}/fashion/fashion-data-control/retrival_frames/frames",
+    #                                    transform=transform)
+
+    dataset = CustomImagePromptDataset(root_dir=f"{data_path}/fashion/feb/shops/fashion-shops-plus-size-unfiltered",
+                                       transform=transform)
 
     # DataLoaders creation:
     train_dataloader = torch.utils.data.DataLoader(
@@ -807,7 +968,8 @@ def main():
     first_epoch = 0
 
     unet_sd = UNet2DConditionModel.from_pretrained(
-        "runwayml/stable-diffusion-v1-5", subfolder="unet", revision=args.revision, variant=args.variant)
+        args.pretrained_model_name_or_path, subfolder="unet", revision=args.revision, variant=args.variant)
+    # "runwayml/stable-diffusion-v1-5", subfolder="unet", revision=args.revision, variant=args.variant)
     unet_sd.enable_xformers_memory_efficient_attention()
     unet_sd.up_blocks = None
     unet_sd.conv_norm_out = None
@@ -819,14 +981,15 @@ def main():
     # Potentially load in the weights and states from a previous save
     print(args.resume_from_checkpoint)
     if args.resume_from_checkpoint:
-        if args.resume_from_checkpoint != "latest":
+        if args.resume_from_checkpoint.startswith("/artifacts/") and find_last_checkpoint(args.output_dir) is None:
+            args.resume_from_checkpoint = os.path.join(artifacts_path,
+                                                       "/".join(args.resume_from_checkpoint.split("/")[2:]))
+            path = args.resume_from_checkpoint
+        elif args.resume_from_checkpoint != "latest":
             path = os.path.basename(args.resume_from_checkpoint)
         else:
             # Get the most recent checkpoint
-            dirs = os.listdir(args.output_dir)
-            dirs = [d for d in dirs if d.startswith("checkpoint")]
-            dirs = sorted(dirs, key=lambda x: int(x.split("-")[1]))
-            path = dirs[-1] if len(dirs) > 0 else None
+            path = find_last_checkpoint(args.output_dir)
 
         if path is None:
             accelerator.print(
@@ -834,16 +997,54 @@ def main():
             )
             args.resume_from_checkpoint = None
             initial_global_step = 0
+            if accelerator.is_main_process:
+                wandb.init(project=args.tracker_project_name, config=args)
+                os.makedirs(args.output_dir, exist_ok=True)
+                with open(os.path.join(args.output_dir, "wandb_run_id.txt"), "w") as f:
+                    f.write(wandb.run.id)
+
+        elif path.startswith(artifacts_path):
+            if not os.path.basename(path).startswith("checkpoint"):
+                path = os.path.join(path, find_last_checkpoint(path))
+            if path is None:
+                raise ValueError(f"Checkpoint '{args.resume_from_checkpoint}' does not exist.")
+            accelerator.print(f"Resuming from checkpoint {path}")
+            accelerator.load_state(path)
+            global_step = int(path.split("-")[-1])
+            initial_global_step = global_step
+            first_epoch = global_step // num_update_steps_per_epoch
+            accelerator.print(f"Resuming from checkpoint {path}"
+                              f" at global_step {global_step} (epoch {first_epoch})")
+            if accelerator.is_main_process:
+                wandb.init(project=args.tracker_project_name, config=args)
+                os.makedirs(args.output_dir, exist_ok=True)
+                with open(os.path.join(args.output_dir, "wandb_run_id.txt"), "w") as f:
+                    f.write(wandb.run.id)
         else:
             accelerator.print(f"Resuming from checkpoint {path}")
             accelerator.load_state(os.path.join(args.output_dir, path))
             global_step = int(path.split("-")[1])
 
+            # initial_global_step = global_step
+            # first_epoch = global_step // num_update_steps_per_epoch
+            if accelerator.is_main_process:
+                with open(os.path.join(args.output_dir, "wandb_run_id.txt"), "r") as f:
+                    wandb_run_id = f.read()
+                wandb.init(project=args.tracker_project_name, id=wandb_run_id, resume="must")
+                           # resume_from=f"{wandb_run_id}?_step={global_step}")
+                print(wandb.run.step)
+
+            global_step = wandb.run.step
             initial_global_step = global_step
             first_epoch = global_step // num_update_steps_per_epoch
 
     else:
         initial_global_step = 0
+        if accelerator.is_main_process:
+            wandb.init(project=args.tracker_project_name, config=args)
+            os.makedirs(args.output_dir, exist_ok=True)
+            with open(os.path.join(args.output_dir, "wandb_run_id.txt"), "w") as f:
+                f.write(wandb.run.id)
 
     progress_bar = tqdm(
         range(0, args.max_train_steps),
@@ -860,11 +1061,24 @@ def main():
     from diffusers import AutoPipelineForText2Image
     # pipe_sdxl = AutoPipelineForText2Image.from_pretrained("stabilityai/sdxl-turbo", torch_dtype=torch.float16,  variant="fp16")
     # pipe_sdxl.vae = AutoencoderKL.from_pretrained("madebyollin/sdxl-vae-fp16-fix", torch_dtype=torch.float16)
-    pipe_sdxl = AutoPipelineForText2Image.from_pretrained("stabilityai/sd-turbo", vae=vae, torch_dtype=torch.float16,
-                                                          variant="fp16")
-    pipe_sdxl.to(accelerator.device)
-    pipe_sdxl.set_progress_bar_config(disable=True)
-    pipe_sdxl.enable_xformers_memory_efficient_attention()
+    # pipe_sdxl = AutoPipelineForText2Image.from_pretrained("stabilityai/sd-turbo", vae=vae, torch_dtype=torch.float16,
+    #                                                       variant="fp16")
+    # pipe_sdxl.to(accelerator.device)
+    # pipe_sdxl.set_progress_bar_config(disable=True)
+    # pipe_sdxl.enable_xformers_memory_efficient_attention()
+    pipeline = StableDiffusionPipeline.from_pretrained(
+        args.pretrained_model_name_or_path, subfolder="pipeline", revision=args.revision, torch_dtype=weight_dtype
+    )
+    pipeline.to(accelerator.device)
+    pipeline.set_progress_bar_config(disable=True)
+    pipeline.enable_xformers_memory_efficient_attention()
+    pipeline.scheduler = deepcopy(noise_scheduler)
+    del pipeline.unet
+    if isinstance(unet, DistributedDataParallel):
+        pipeline.unet = unet.module
+    else:
+        pipeline.unet = unet
+
     # pipe_sdxl.to(unet.device)
     # pipe_sdxl.unet.eval()
     # pipe_sdxl.unet.requires_grad_(False)
@@ -872,24 +1086,32 @@ def main():
         train_loss = 0.0
         train_d_real = 0.0
         train_d_fake = 0.0
+        total_steps = 0
         for step, batch in enumerate(train_dataloader):
+            torch.cuda.empty_cache()
             with accelerator.accumulate(unet, unet_gan):
                 # Convert images to latent space\
                 text_ = list(batch[0])
-                noise = torch.randn([len(text_), 4, 64, 64])
+                # noise = torch.randn([len(text_), 4, 64, 64])
+                # with torch.no_grad():
+                #     # Generate Data By SD-turbo with 2 steps, instead of use JourneyDB which yeilds the style shift.
+                #     latents = pipe_sdxl(prompt=text_, num_inference_steps=1, guidance_scale=0.0, output_type="latent",
+                #                         latents=noise.to(pipe_sdxl.unet.dtype))[0]
+                images = batch[2].to(weight_dtype)
                 with torch.no_grad():
-                    # Generate Data By SD-turbo with 2 steps, instead of use JourneyDB which yeilds the style shift.
-                    latents = pipe_sdxl(prompt=text_, num_inference_steps=1, guidance_scale=0.0, output_type="latent",
-                                        latents=noise.to(pipe_sdxl.unet.dtype))[0]
+                    latents = vae.encode(images).latent_dist.sample()
+                    latents = latents * vae.config.scaling_factor  # get latent of real data.
+                #     latents = pipe_sdxl.vae.encode(images).latent_dist.sample()
+
                 #     images = pipe_sdxl.vae.decode(latents / pipe_sdxl.vae.config.scaling_factor, return_dict=False)[0].to(weight_dtype).clamp(-1,1)
                 # latents = vae.encode(images).latent_dist.sample()
                 # latents = latents * vae.config.scaling_factor # get latent of real data.
                 # Do not need encode. As the SD-2.1 share the same encoder with SD-1.5
 
                 # Get the target for loss depending on the prediction type
-                if args.prediction_type is not None:
-                    # set prediction_type of scheduler if defined
-                    noise_scheduler.register_to_config(prediction_type=args.prediction_type)
+                # if args.prediction_type is not None:
+                #     # set prediction_type of scheduler if defined
+                #     noise_scheduler.register_to_config(prediction_type=args.prediction_type)
 
                 # Sample noise that we'll add to the latents
                 noise = torch.randn_like(latents)
@@ -965,9 +1187,9 @@ def main():
                 D_final_loss += errD_fake
                 accelerator.backward(D_final_loss)
 
-                wandb.log({"D_real": D_real, "D_fake": D_fake, "D_final_loss": D_final_loss,
-                           "lr": lr_scheduler.get_last_lr()[0],
-                           "errD": errD, "errD_real": errD_real, "errD_fake": errD_fake}, step=step)
+                if accelerator.is_main_process:
+                    wandb.log({"D_real": D_real, "D_fake": D_fake, "D_final_loss": D_final_loss,
+                               "errD": errD, "errD_real": errD_real, "errD_fake": errD_fake}, step=global_step)
 
                 avg_real_loss = accelerator.gather(D_real.repeat(args.train_batch_size)).mean()
                 avg_fake_loss = accelerator.gather(D_fake.repeat(args.train_batch_size)).mean()
@@ -1035,7 +1257,7 @@ def main():
                 # loss = F.mse_loss(pred_x_0.float(), target.float(), reduction="none")
                 # print(target_z.shape)
                 loss = F.mse_loss(pred_x0_z.float(), target_z.float(), reduction="none")
-                loss = loss.mean(dim=list(range(1, len(loss.shape)))) # * mse_loss_weights
+                loss = loss.mean(dim=list(range(1, len(loss.shape))))  # * mse_loss_weights
                 loss_unweighted = loss.mean()
                 loss = loss * mse_loss_weights
                 # kl_loss = F.mse_loss(pred_x_0.float(), latents.float(), reduction='none').mean(
@@ -1056,12 +1278,29 @@ def main():
                 avg_loss = accelerator.gather(loss.repeat(args.train_batch_size)).mean()
                 train_loss += avg_loss.item() / args.gradient_accumulation_steps
 
-                # Backpropagate
-                accelerator.backward(args.lambda_con * loss + args.lambda_kl * kl_loss + errG_gan)
+                avg_kl_loss = accelerator.gather(kl_loss.repeat(args.train_batch_size)).mean()
+                avg_loss_unweighted = accelerator.gather(loss_unweighted.repeat(args.train_batch_size)).mean()
 
-                wandb.log({"loss": loss, "kl_loss": kl_loss, "errG_gan": errG_gan,
-                           "loss_unweighted": loss_unweighted, "kl_loss_unweighted": kl_loss_unweighted,
-                           "total_G_loss": args.lambda_con * loss + args.lambda_kl * kl_loss + errG_gan}, step=step)
+                if args.adaptive_annealing_steps > 1:
+                    annealing_weight = \
+                        (1 - math.floor(global_step / (args.max_train_steps / args.adaptive_annealing_steps))
+                         / (args.adaptive_annealing_steps - 1))
+                else:
+                    annealing_weight = 1.0
+
+                # Backpropagate
+                accelerator.backward(annealing_weight * args.lambda_con * loss +
+                                     annealing_weight * args.lambda_kl * kl_loss + errG_gan)
+
+                if accelerator.is_main_process:
+                    wandb.log({"loss": loss, "kl_loss": kl_loss, "errG_gan": errG_gan, "avg_loss": avg_loss,
+                               "avg_kl_loss": avg_kl_loss, "avg_loss_unweighted": avg_loss_unweighted,
+                               "loss_unweighted": loss_unweighted, "kl_loss_unweighted": kl_loss_unweighted,
+                               "annealing_weight": annealing_weight,
+                               "total_G_loss": annealing_weight * args.lambda_con * loss +
+                                               annealing_weight * args.lambda_kl * kl_loss +
+                                               errG_gan}, step=global_step)
+                    # "total_G_loss": args.lambda_con * loss + args.lambda_kl * kl_loss + errG_gan}, step=global_step)
 
                 if accelerator.sync_gradients:
                     accelerator.clip_grad_norm_(unet.parameters(), args.max_grad_norm)
@@ -1078,8 +1317,8 @@ def main():
                         images_t = vae.decode(pred_x_0.to(vae.dtype) / vae.config.scaling_factor, return_dict=False)[0]
                         images_pervt = vae.decode(target.to(vae.dtype) / vae.config.scaling_factor, return_dict=False)[
                             0]
-                        pure_noisy = noise_scheduler.add_noise(latents, noise, T_)
-
+                        # pure_noisy = noise_scheduler.add_noise(latents, noise, T_)
+                        pure_noisy = torch.randn_like(latents)
                         noise_pred = unet(pure_noisy, T_,
                                           encoder_hidden_states, return_dict=False)[0]
                         noise_generation = predicted_origin(
@@ -1090,6 +1329,13 @@ def main():
                             alpha_schedule,
                             sigma_schedule,
                         )
+                        n_steps = 4
+                        with torch.autocast(device_type="cuda", dtype=weight_dtype):
+                            images_pipeline = pipeline(prompt=text_, num_inference_steps=n_steps, guidance_scale=1.0,
+                                                       output_type="pt", return_dict=False, latents=pure_noisy)[0]
+                            images_pipeline_cfg = pipeline(prompt=text_, num_inference_steps=n_steps, guidance_scale=3.0,
+                                                           output_type="pt", return_dict=False, latents=pure_noisy)[0]
+
                         images_noise = \
                             vae.decode(noise_generation.to(vae.dtype) / vae.config.scaling_factor, return_dict=False)[0]
                         images_real = vae.decode(latents.to(vae.dtype) / vae.config.scaling_factor, return_dict=False)[
@@ -1098,6 +1344,9 @@ def main():
                         images_t = images_t.clamp(-1, 1) * 0.5 + 0.5
                         images_pervt = images_pervt.clamp(-1, 1) * 0.5 + 0.5
                         images_noise = images_noise.clamp(-1, 1) * 0.5 + 0.5
+                        images_pipeline = images_pipeline.clamp(-1, 1) * 0.5 + 0.5
+                        images_pipeline_cfg = images_pipeline_cfg.clamp(-1, 1) * 0.5 + 0.5
+
                         # save_image(images_t, f'./{args.output_dir}/iamges_t_selfper.jpg', normalize=False, nrow=4)
                         # save_image(images_pervt, f'./{args.output_dir}/images_prevt_selfper.jpg', normalize=False,
                         #            nrow=4)
@@ -1109,9 +1358,16 @@ def main():
                         #            normalize=False, nrow=4)
                         save_image(images_real.clamp(-1, 1) * 0.5 + 0.5, os.path.join(save_dir, 'real_data.jpg'),
                                    normalize=False, nrow=4)
+                        save_image(images_pipeline, os.path.join(save_dir, 'pipeline.jpg'), normalize=False, nrow=4)
+                        save_image(images_pipeline_cfg, os.path.join(save_dir, 'pipeline_cfg.jpg'), normalize=False,
+                                   nrow=4)
+
                         wandb.log({"images_t": wandb.Image(images_t), "images_pervt": wandb.Image(images_pervt),
                                    "images_singlestep": wandb.Image(images_noise),
-                                   "images_real": wandb.Image(images_real)}, step=step)
+                                   "images_pipeline": wandb.Image(images_pipeline),
+                                   "images_pipeline_cfg": wandb.Image(images_pipeline_cfg),
+
+                                   "images_real": wandb.Image(images_real)}, step=global_step)
 
             # Checks if the accelerator has performed an optimization step behind the scenes
             if accelerator.sync_gradients:
@@ -1127,8 +1383,9 @@ def main():
                 accelerator.log({"train_loss": train_loss, "d_real": train_d_real, "d_fake": train_d_fake},
                                 step=global_step)
 
-                wandb.log({"train_loss": train_loss, "d_real": train_d_real, "d_fake": train_d_fake,
-                           }, )
+                if accelerator.is_main_process:
+                    wandb.log({"train_loss": train_loss, "d_real": train_d_real, "d_fake": train_d_fake,
+                               }, )
                 train_loss = 0.0
                 train_d_real = 0.0
                 train_d_fake = 0.0
@@ -1167,6 +1424,16 @@ def main():
             if global_step >= args.max_train_steps:
                 break
     accelerator.end_training()
+
+
+def find_last_checkpoint(output_dir):
+    if not os.path.exists(output_dir):
+        return None
+    dirs = os.listdir(output_dir)
+    dirs = [d for d in dirs if d.startswith("checkpoint")]
+    dirs = sorted(dirs, key=lambda x: int(x.split("-")[1]))
+    path = dirs[-1] if len(dirs) > 0 else None
+    return path
 
 
 if __name__ == "__main__":

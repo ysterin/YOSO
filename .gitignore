@@ -1,0 +1,7 @@
+# gitignore
+# Ignore all files in this directory
+
+yoso_lora/
+.idea/
+*.pyc
+/yoso_lora.safetensors
