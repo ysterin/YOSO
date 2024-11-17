@@ -20,6 +20,7 @@ import shutil
 from pathlib import Path
 import accelerate
 import datasets
+import matplotlib.pyplot as plt
 import transformers
 from accelerate import Accelerator
 from accelerate.logging import get_logger
@@ -27,6 +28,7 @@ from accelerate.state import AcceleratorState
 from accelerate.utils import ProjectConfiguration, set_seed
 from huggingface_hub import create_repo
 from packaging import version
+from torch.nn.parallel import DistributedDataParallel
 from torchvision.utils import save_image
 from tqdm.auto import tqdm
 from transformers import CLIPTextModel, CLIPTokenizer
@@ -388,6 +390,13 @@ def parse_args():
         default=None,
         help="api",
     )
+    parser.add_argument(
+        "--synthetic_data_model",
+        type=str,
+        choices=["sd_turbo", "sdxl_turbo"],
+        default="sd_turbo",
+        help="The model to use for generating synthetic data."
+    )
 
     # args = parser.parse_args()
     args, _ = parser.parse_known_args()
@@ -414,7 +423,6 @@ def extract_into_tensor(a, t, x_shape):
 
 def main():
     args = parse_args()
-
 
     if args.non_ema_revision is not None:
         deprecate(
@@ -569,19 +577,19 @@ def main():
     # unet = get_peft_model(unet, lora_config)
     # ema_lora_state_dict =  get_peft_model_state_dict(unet_, adapter_name="default")
     # unet_gan.unet = get_peft_model(unet_gan.unet, lora_config)
-    from copy import deepcopy
-    # Create EMA for the unet.
-    if args.use_ema:
-        # dic_lora = get_peft_model_state_dict(unet, adapter_name="default")
-        # dic_lora = get_module_kohya_state_dict(unet, "lora_unet", torch.float32)
-        # ema_dic_lora = deepcopy(dic_lora)
-        # ema_unet = UNet2DConditionModel.from_pretrained(
-        #     args.pretrained_model_name_or_path, subfolder="unet", revision=args.revision, variant=args.variant
-        # )
-        ema_unet = deepcopy(unet)
-        ema_unet = EMAModel(ema_unet.parameters(), model_cls=UNet2DConditionModel, model_config=ema_unet.config,
-                            decay=0.999)
-        # ema_unet = accelerator.prepare_model(ema_unet)
+    # from copy import deepcopy
+    # # Create EMA for the unet.
+    # if args.use_ema:
+    #     # dic_lora = get_peft_model_state_dict(unet, adapter_name="default")
+    #     # dic_lora = get_module_kohya_state_dict(unet, "lora_unet", torch.float32)
+    #     # ema_dic_lora = deepcopy(dic_lora)
+    #     # ema_unet = UNet2DConditionModel.from_pretrained(
+    #     #     args.pretrained_model_name_or_path, subfolder="unet", revision=args.revision, variant=args.variant
+    #     # )
+    #     ema_unet = deepcopy(unet)
+    #     ema_unet = EMAModel(ema_unet.parameters(), model_cls=UNet2DConditionModel, model_config=ema_unet.config,
+    #                         decay=0.999)
+    #     # ema_unet = accelerator.prepare_model(ema_unet)
 
     if args.enable_xformers_memory_efficient_attention:
         if is_xformers_available():
@@ -603,42 +611,42 @@ def main():
         def save_model_hook(models, weights, output_dir):
             if accelerator.is_main_process:
                 unet_ = accelerator.unwrap_model(unet)
-                unet_.save_adapter(os.path.join(output_dir, "unet"), "default")
-                # lora_state_dict = get_peft_model_state_dict(unet_, adapter_name="default")
-                # StableDiffusionPipeline.save_lora_weights(os.path.join(output_dir, "unet_lora"), lora_state_dict)
-                # unet_.save_pretrained(os.path.join(output_dir, "unet"))
-
-                # torch.save(ema_dic_lora, os.path.join(output_dir, 'ema_lora.pt'))
-                # ema_dic_lora
-                # ema_lora_state_dict = get_peft_model_state_dict(unet_, adapter_name="default")
-                # StableDiffusionPipeline.save_lora_weights(os.path.join(output_dir, "unet_lora_ema"), ema_lora_state_dict)
-                # ema_unet.save_pretrained(os.path.join(output_dir, "unet"))
-                # unet_gan_ = accelerator.unwrap_model(unet_gan)
-                # unet_gan_.save_pretrained(os.path.join(output_dir, "unet_GAN"))
+                unet_.save_pretrained(os.path.join(output_dir, "unet"))
+                if args.use_ema:
+                    ema_unet.save_pretrained(os.path.join(output_dir, "unet_ema"))
+                unet_gan_ = accelerator.unwrap_model(unet_gan)
+                unet_gan_.save_pretrained(os.path.join(output_dir, "unet_GAN"))
 
                 for i, model in enumerate(models):
                     weights.pop()
 
         def load_model_hook(models, input_dir):
+            if args.use_ema:
+                load_model = EMAModel.from_pretrained(os.path.join(input_dir, "unet_ema"), UNet2DConditionModel)
+                ema_unet.load_state_dict(load_model.state_dict())
+                ema_unet.to(accelerator.device)
+                del load_model
+            load_model = UNet2DConditionModel.from_pretrained(input_dir, subfolder="unet")
+            unet.load_state_dict(load_model.state_dict())
+            del load_model
+            # unet_ = accelerator.unwrap_model(unet)
+            # unet_.load(os.path.join(input_dir, "unet"), "default", is_trainable=True)
             # if args.use_ema:
-            #     load_model = EMAModel.from_pretrained(os.path.join(input_dir, "unet_ema"), UNet2DConditionModel)
-            #     ema_unet.load_state_dict(load_model.state_dict())
-            #     ema_unet.to(accelerator.device)
-            #     del load_model
-            unet_ = accelerator.unwrap_model(unet)
-            unet_.load_adapter(os.path.join(input_dir, "unet"), "default", is_trainable=True)
+            #     ema_unet.load(os.path.join(input_dir, "unet"), "default", is_trainable=False)
+            # unet_gan_ = accelerator.unwrap_model(unet_gan)
+            # unet_gan_.load(os.path.join(input_dir, "unet_GAN"), "default", is_trainable=True)
 
             for i in range(len(models)):
                 # pop models so that they are not loaded again
                 model = models.pop()
-            #     if isinstance(model, My_Dis):
-            #         # save_pth_ = os.path.join(output_dir, "unetGAN")
-            #         # checkpoint = torch.load(os.path.join('unet_gan.pth'))
-            #         # model.load_state_dict(checkpoint)
-            #         load_model = My_Dis.from_pretrained(input_dir, subfolder="unetGAN")
-            #         model.register_to_config(**load_model.config)
-            #         model.load_state_dict(load_model.state_dict())
-            #         del load_model
+                if isinstance(model, My_Dis):
+                    # save_pth_ = os.path.join(output_dir, "unetGAN")
+                    # checkpoint = torch.load(os.path.join('unet_gan.pth'))
+                    # model.load_state_dict(checkpoint)
+                    load_model = My_Dis.from_pretrained(input_dir, subfolder="unet_GAN")
+                    model.register_to_config(**load_model.config)
+                    model.load_state_dict(load_model.state_dict())
+                    del load_model
             #     else:
             #         # load diffusers style into model
             #         load_model = UNet2DConditionModel.from_pretrained(input_dir, subfolder="unet")
@@ -761,6 +769,24 @@ def main():
     # if args.use_ema:
     #     ema_unet.to(accelerator.device)
 
+    from copy import deepcopy
+    # Create EMA for the unet.
+    if args.use_ema:
+        # dic_lora = get_peft_model_state_dict(unet, adapter_name="default")
+        # dic_lora = get_module_kohya_state_dict(unet, "lora_unet", torch.float32)
+        # ema_dic_lora = deepcopy(dic_lora)
+        # ema_unet = UNet2DConditionModel.from_pretrained(
+        #     args.pretrained_model_name_or_path, subfolder="unet", revision=args.revision, variant=args.variant
+        # )
+        # ema_unet = deepcopy(unet)
+        if isinstance(unet, DistributedDataParallel):
+            ema_unet = deepcopy(unet.module)
+        else:
+            ema_unet = deepcopy(unet)
+        ema_unet = EMAModel(ema_unet.parameters(), model_cls=UNet2DConditionModel, model_config=ema_unet.config,
+                            decay=0.999)
+        # ema_unet = accelerator.prepare_model(ema_unet)
+
     # For mixed precision training we cast all non-trainable weigths (vae, non-lora text_encoder and non-lora unet) to half-precision
     # as these weights are only used for inference, keeping weights in full precision is not required.
     weight_dtype = torch.float32
@@ -862,14 +888,24 @@ def main():
     from diffusers import AutoPipelineForText2Image
     # pipe_sdxl = AutoPipelineForText2Image.from_pretrained("stabilityai/sdxl-turbo", torch_dtype=torch.float16,  variant="fp16")
     # pipe_sdxl.vae = AutoencoderKL.from_pretrained("madebyollin/sdxl-vae-fp16-fix", torch_dtype=torch.float16)
-    pipe_sdxl = AutoPipelineForText2Image.from_pretrained("stabilityai/sd-turbo", vae=vae, torch_dtype=torch.float16,
-                                                          variant="fp16")
-    pipe_sdxl.to(accelerator.device)
-    pipe_sdxl.set_progress_bar_config(disable=True)
-    pipe_sdxl.enable_xformers_memory_efficient_attention()
-    # pipe_sdxl.to(unet.device)
-    # pipe_sdxl.unet.eval()
-    # pipe_sdxl.unet.requires_grad_(False)
+    # # pipe_sdxl = AutoPipelineForText2Image.from_pretrained("stabilityai/sd-turbo", vae=vae, torch_dtype=torch.float16,
+    # #                                                       variant="fp16")
+    # pipe_sdxl.to(accelerator.device)
+    # pipe_sdxl.set_progress_bar_config(disable=True)
+    # pipe_sdxl.enable_xformers_memory_efficient_attention
+    if args.synthetic_data_model == "sd_turbo":
+        pipe_synth = AutoPipelineForText2Image.from_pretrained("stabilityai/sd-turbo", torch_dtype=torch.float16,
+                                                                variant="fp16")
+    elif args.synthetic_data_model == "sdxl_turbo":
+        pipe_synth = AutoPipelineForText2Image.from_pretrained("stabilityai/sdxl-turbo", torch_dtype=torch.float16,
+                                                                variant="fp16")
+        pipe_synth.vae = AutoencoderKL.from_pretrained("madebyollin/sdxl-vae-fp16-fix", torch_dtype=torch.float16)
+    else:
+        raise ValueError("Invalid synthetic data model")
+    pipe_synth.to(accelerator.device)
+    pipe_synth.set_progress_bar_config(disable=True)
+    pipe_synth.enable_xformers_memory_efficient_attention
+
     for epoch in range(first_epoch, args.num_train_epochs):
         train_loss = 0.0
         train_d_real = 0.0
@@ -881,8 +917,38 @@ def main():
                 noise = torch.randn([len(text_), 4, 64, 64])
                 with torch.no_grad():
                     # Generate Data By SD-turbo with 2 steps, instead of use JourneyDB which yeilds the style shift.
-                    latents = pipe_sdxl(prompt=text_, num_inference_steps=1, guidance_scale=0.0, output_type="latent",
-                                        latents=noise.to(pipe_sdxl.unet.dtype))[0]
+                    if args.synthetic_data_model == "sd_turbo":
+                        latents = pipe_synth(prompt=text_, num_inference_steps=4, guidance_scale=1.5, output_type="latent",
+                                            latents=noise.to(pipe_synth.unet.dtype))[0]
+                    elif args.synthetic_data_model == "sdxl_turbo":
+                        images = pipe_synth(prompt=text_, num_inference_steps=4, guidance_scale=1.5, output_type="image",
+                                            latents=noise.to(pipe_synth.unet.dtype))[0]
+                        images = torch.Tensor(images).to(vae.dtype).to(vae.device).permute(0, 3, 1, 2)
+                        latents = vae.encode(images).latent_dist.sample() * vae.config.scaling_factor  # get latent of real data.
+                    else:
+                        raise ValueError("Invalid synthetic data model")
+                    # latents = pipe_sdxl(prompt=text_, num_inference_steps=4, guidance_scale=1.5, output_type="latent",
+                    #                     latents=noise.to(pipe_sdxl.unet.dtype))[0]
+                    # images1 = pipe_sdxl(prompt=text_, num_inference_steps=1, guidance_scale=1.0, output_type="image",
+                    #                     latents=noise.to(pipe_sdxl.unet.dtype))[0]
+                    # images2 = pipe_sdxl(prompt=text_, num_inference_steps=2, guidance_scale=1.5, output_type="image",
+                    #                     latents=noise.to(pipe_sdxl.unet.dtype))[0]
+                    # images3 = pipe_sdxl(prompt=text_, num_inference_steps=4, guidance_scale=1.5, output_type="image",
+                    #                     latents=noise.to(pipe_sdxl.unet.dtype))[0]
+                    # images4 = pipe_sdxl(prompt=text_, num_inference_steps=8, guidance_scale=1.5, output_type="image",
+                    #                     latents=noise.to(pipe_sdxl.unet.dtype))[0]
+                    # for i in range(len(images1)):
+                    #     plt.tight_layout()
+                    #     fig, axes = plt.subplots(1, 4, figsize=(20, 5))
+                    #     axes[0].imshow(images1[i])
+                    #     axes[1].imshow(images2[i])
+                    #     axes[1].set_title(text_[i])
+                    #     axes[2].imshow(images3[i])
+                    #     axes[3].imshow(images4[i])
+                    #     plt.show()
+
+                        # wandb.log({"image1": wandb.Image(images1[i].cpu().numpy()), "image2": wandb.Image(images2[i].cpu().numpy())}, step=step)
+
                 #     images = pipe_sdxl.vae.decode(latents / pipe_sdxl.vae.config.scaling_factor, return_dict=False)[0].to(weight_dtype).clamp(-1,1)
                 # latents = vae.encode(images).latent_dist.sample()
                 # latents = latents * vae.config.scaling_factor # get latent of real data.
@@ -1036,7 +1102,7 @@ def main():
                 # loss = F.mse_loss(pred_x_0.float(), target.float(), reduction="none")
                 # print(target_z.shape)
                 loss = F.mse_loss(pred_x0_z.float(), target_z.float(), reduction="none")
-                loss = loss.mean(dim=list(range(1, len(loss.shape)))) # * mse_loss_weights
+                loss = loss.mean(dim=list(range(1, len(loss.shape))))  # * mse_loss_weights
                 loss_unweighted = loss.mean()
                 loss = loss * mse_loss_weights
                 # kl_loss = F.mse_loss(pred_x_0.float(), latents.float(), reduction='none').mean(
@@ -1079,6 +1145,8 @@ def main():
                         images_t = vae.decode(pred_x_0.to(vae.dtype) / vae.config.scaling_factor, return_dict=False)[0]
                         images_pervt = vae.decode(target.to(vae.dtype) / vae.config.scaling_factor, return_dict=False)[
                             0]
+                        images_coop = \
+                        vae.decode(coop_latents.to(vae.dtype) / vae.config.scaling_factor, return_dict=False)[0]
                         pure_noisy = noise_scheduler.add_noise(latents, noise, T_)
                         noise_pred = unet(pure_noisy, T_,
                                           encoder_hidden_states, return_dict=False)[0]
@@ -1097,6 +1165,7 @@ def main():
                     if accelerator.is_main_process:
                         images_t = images_t.clamp(-1, 1) * 0.5 + 0.5
                         images_pervt = images_pervt.clamp(-1, 1) * 0.5 + 0.5
+                        images_coop = images_coop.clamp(-1, 1) * 0.5 + 0.5
                         images_noise = images_noise.clamp(-1, 1) * 0.5 + 0.5
                         # save_image(images_t, f'./{args.output_dir}/iamges_t_selfper.jpg', normalize=False, nrow=4)
                         # save_image(images_pervt, f'./{args.output_dir}/images_prevt_selfper.jpg', normalize=False,
@@ -1104,12 +1173,14 @@ def main():
                         save_image(images_t, os.path.join(save_dir, 'iamges_t_selfper.jpg'), normalize=False, nrow=4)
                         save_image(images_pervt, os.path.join(save_dir, 'images_prevt_selfper.jpg'), normalize=False,
                                    nrow=4)
+                        save_image(images_coop, os.path.join(save_dir, 'images_coop.jpg'), normalize=False, nrow=4)
                         save_image(images_noise, os.path.join(save_dir, 'singlestep.jpg'), normalize=False, nrow=4)
                         # save_image(images_real.clamp(-1, 1) * 0.5 + 0.5, f'./{args.output_dir}/real_data.jpg',
                         #            normalize=False, nrow=4)
                         save_image(images_real.clamp(-1, 1) * 0.5 + 0.5, os.path.join(save_dir, 'real_data.jpg'),
                                    normalize=False, nrow=4)
                         wandb.log({"images_t": wandb.Image(images_t), "images_pervt": wandb.Image(images_pervt),
+                                   "images_coop": wandb.Image(images_coop),
                                    "images_singlestep": wandb.Image(images_noise),
                                    "images_real": wandb.Image(images_real)}, step=step)
 
@@ -1122,7 +1193,7 @@ def main():
                     #     ema_unet[k] = decay * deepcopy(ema_unet[k]).to(v.device) + (1 - decay) * (deepcopy(v))
                     # dic_lora = get_module_kohya_state_dict(unet_, "lora_unet", torch.float32)
                     # for k, v in dic_lora.items():
-                        # ema_dic_lora[k] = decay * deepcopy(ema_dic_lora[k]).to(v.device) + (1 - decay) * (deepcopy(v))
+                    # ema_dic_lora[k] = decay * deepcopy(ema_dic_lora[k]).to(v.device) + (1 - decay) * (deepcopy(v))
                     ema_unet.step(unet.parameters())
                 progress_bar.update(1)
                 global_step += 1

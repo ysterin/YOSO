@@ -5,3 +5,4 @@ yoso_lora/
 .idea/
 *.pyc
 /yoso_lora.safetensors
+/yoso_lora (1).safetensors

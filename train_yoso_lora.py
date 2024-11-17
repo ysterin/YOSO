@@ -604,8 +604,8 @@ def main():
                 lora_state_dict = get_peft_model_state_dict(unet_, adapter_name="default")
                 StableDiffusionPipeline.save_lora_weights(os.path.join(output_dir, "unet_lora"), lora_state_dict)
                 unet_.save_pretrained(os.path.join(output_dir, "unet"))
-
-                torch.save(ema_dic_lora, os.path.join(output_dir, 'ema_lora.pt'))
+                if args.use_ema:
+                    torch.save(ema_dic_lora, os.path.join(output_dir, 'ema_lora.pt'))
                 # ema_dic_lora
                 # ema_lora_state_dict = get_peft_model_state_dict(unet_, adapter_name="default")
                 # StableDiffusionPipeline.save_lora_weights(os.path.join(output_dir, "unet_lora_ema"), ema_lora_state_dict)
@@ -684,8 +684,8 @@ def main():
     optimizer_d = optimizer_cls(
         unet_gan.parameters(),
         lr=args.learning_rate,
-        # betas=(0., args.adam_beta2),
-        betas=(args.adam_beta1, args.adam_beta2),
+        betas=(0., args.adam_beta2),
+        # betas=(args.adam_beta1, args.adam_beta2),
         weight_decay=args.adam_weight_decay,
         eps=args.adam_epsilon,
     )
@@ -879,7 +879,7 @@ def main():
                 noise = torch.randn([len(text_), 4, 64, 64])
                 with torch.no_grad():
                     # Generate Data By SD-turbo with 2 steps, instead of use JourneyDB which yeilds the style shift.
-                    latents = pipe_sdxl(prompt=text_, num_inference_steps=1, guidance_scale=0.0, output_type="latent",
+                    latents = pipe_sdxl(prompt=text_, num_inference_steps=4, guidance_scale=1.5, output_type="latent",
                                         latents=noise.to(pipe_sdxl.unet.dtype))[0]
                 #     images = pipe_sdxl.vae.decode(latents / pipe_sdxl.vae.config.scaling_factor, return_dict=False)[0].to(weight_dtype).clamp(-1,1)
                 # latents = vae.encode(images).latent_dist.sample()
@@ -1078,6 +1078,8 @@ def main():
                         images_t = vae.decode(pred_x_0.to(vae.dtype) / vae.config.scaling_factor, return_dict=False)[0]
                         images_pervt = vae.decode(target.to(vae.dtype) / vae.config.scaling_factor, return_dict=False)[
                             0]
+                        images_coop = \
+                        vae.decode(coop_latents.to(vae.dtype) / vae.config.scaling_factor, return_dict=False)[0]
                         pure_noisy = noise_scheduler.add_noise(latents, noise, T_)
 
                         noise_pred = unet(pure_noisy, T_,
@@ -1097,6 +1099,7 @@ def main():
                     if accelerator.is_main_process:
                         images_t = images_t.clamp(-1, 1) * 0.5 + 0.5
                         images_pervt = images_pervt.clamp(-1, 1) * 0.5 + 0.5
+                        images_coop = images_coop.clamp(-1, 1) * 0.5 + 0.5
                         images_noise = images_noise.clamp(-1, 1) * 0.5 + 0.5
                         # save_image(images_t, f'./{args.output_dir}/iamges_t_selfper.jpg', normalize=False, nrow=4)
                         # save_image(images_pervt, f'./{args.output_dir}/images_prevt_selfper.jpg', normalize=False,
@@ -1104,12 +1107,14 @@ def main():
                         save_image(images_t, os.path.join(save_dir, 'iamges_t_selfper.jpg'), normalize=False, nrow=4)
                         save_image(images_pervt, os.path.join(save_dir, 'images_prevt_selfper.jpg'), normalize=False,
                                    nrow=4)
+                        save_image(images_coop, os.path.join(save_dir, 'images_coop.jpg'), normalize=False, nrow=4)
                         save_image(images_noise, os.path.join(save_dir, 'singlestep.jpg'), normalize=False, nrow=4)
                         # save_image(images_real.clamp(-1, 1) * 0.5 + 0.5, f'./{args.output_dir}/real_data.jpg',
                         #            normalize=False, nrow=4)
                         save_image(images_real.clamp(-1, 1) * 0.5 + 0.5, os.path.join(save_dir, 'real_data.jpg'),
                                    normalize=False, nrow=4)
                         wandb.log({"images_t": wandb.Image(images_t), "images_pervt": wandb.Image(images_pervt),
+                                   "images_coop": wandb.Image(images_coop),
                                    "images_singlestep": wandb.Image(images_noise),
                                    "images_real": wandb.Image(images_real)}, step=step)
 
