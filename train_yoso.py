@@ -37,7 +37,7 @@ from peft import LoraConfig, get_peft_model, get_peft_model_state_dict
 
 from unet import UNet2DConditionModel
 import diffusers
-from diffusers import AutoencoderKL, DDPMScheduler, StableDiffusionPipeline, EMAModel
+from diffusers import AutoencoderKL, DDPMScheduler, StableDiffusionPipeline, EMAModel, DDIMScheduler, LCMScheduler
 from diffusers.optimization import get_scheduler
 from diffusers.utils import check_min_version, deprecate, is_wandb_available
 from diffusers.utils.import_utils import is_xformers_available
@@ -79,9 +79,9 @@ def predicted_origin(model_output, timesteps, sample, prediction_type, alphas, s
     return pred_x_0
 
 
-def scalings_for_boundary_conditions(timestep, sigma_data=0.5, timestep_scaling=10.0):
+def scalings_for_boundary_conditions(timestep, sigma_data=1.0, timestep_scaling=10.0):
     c_skip = sigma_data ** 2 / ((timestep / 0.1) ** 2 + sigma_data ** 2)
-    c_out = (timestep / 0.1) / ((timestep / 0.1) ** 2 + sigma_data ** 2) ** 0.5
+    c_out = sigma_data * (timestep / 0.1) / ((timestep / 0.1) ** 2 + sigma_data ** 2) ** 0.5
     return c_skip, c_out
 
 
@@ -397,6 +397,17 @@ def parse_args():
         default="sd_turbo",
         help="The model to use for generating synthetic data."
     )
+    parser.add_argument(
+        "--dont_use_boundary_scalings",
+        action="store_true",
+        help="Whether to use boundary scaling for the diffusion model."
+    )
+    parser.add_argument(
+        "--noise_schedule",
+        type=str,
+        default="ddpm",
+        help="The noise schedule to use for the diffusion model. options are ['ddpm', 'ddim', 'lcm']"
+    )
 
     # args = parser.parse_args()
     args, _ = parser.parse_known_args()
@@ -423,6 +434,12 @@ def extract_into_tensor(a, t, x_shape):
 
 def main():
     args = parse_args()
+
+    data_path = os.getenv("DATA_PATH", "/mnt/data")
+    artifacts_path = os.getenv("ARTIFACTS_PATH", "/mnt/artifacts")
+
+    if args.output_dir.startswith("/artifacts/"):
+        args.output_dir = os.path.join(artifacts_path, "/".join(args.output_dir.split("/")[2:]))
 
     if args.non_ema_revision is not None:
         deprecate(
@@ -469,7 +486,8 @@ def main():
         os.environ['WANDB_API_KEY'] = os.environ.get('WANDB_API_KEY', args.wandb)
         wandb.login(key=args.wandb)
 
-    wandb.init(project=args.tracker_project_name, config=args)
+    if accelerator.is_main_process:
+        wandb.init(project=args.tracker_project_name, config=args)
 
     # Handle the repository creation
     if accelerator.is_main_process:
@@ -482,7 +500,17 @@ def main():
             ).repo_id
 
     # Load scheduler, tokenizer and models.
-    noise_scheduler = DDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
+    if args.noise_schedule == "ddpm":
+        noise_scheduler = DDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler",
+                                                        timestep_spacing="trailing")
+    elif args.noise_schedule == "ddim":
+        noise_scheduler = DDIMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler",
+                                                        timestep_spacing="trailing")
+    elif args.noise_schedule == "lcm":
+        noise_scheduler = LCMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler",
+                                                        timestep_spacing="trailing")
+    else:
+        raise ValueError(f"Invalid noise schedule {args.noise_schedule}.")
     alpha_schedule = torch.sqrt(noise_scheduler.alphas_cumprod)
     sigma_schedule = torch.sqrt(1 - noise_scheduler.alphas_cumprod)
     tokenizer = CLIPTokenizer.from_pretrained(
@@ -517,6 +545,7 @@ def main():
         vae = AutoencoderKL.from_pretrained(
             args.pretrained_model_name_or_path, subfolder="vae", revision=args.revision, variant=args.variant
         )
+
 
     unet = UNet2DConditionModel.from_pretrained(
         args.pretrained_model_name_or_path, subfolder="unet", revision=args.revision, variant=args.variant
@@ -893,6 +922,15 @@ def main():
     # pipe_sdxl.to(accelerator.device)
     # pipe_sdxl.set_progress_bar_config(disable=True)
     # pipe_sdxl.enable_xformers_memory_efficient_attention
+    pipeline = StableDiffusionPipeline.from_pretrained(
+        args.pretrained_model_name_or_path, subfolder="pipeline", revision=args.revision, torch_dtype=weight_dtype
+    )
+    pipeline.to(accelerator.device)
+    pipeline.set_progress_bar_config(disable=True)
+    pipeline.enable_xformers_memory_efficient_attention()
+    pipeline.scheduler = deepcopy(noise_scheduler)
+    del pipeline.unet
+
     if args.synthetic_data_model == "sd_turbo":
         pipe_synth = AutoPipelineForText2Image.from_pretrained("stabilityai/sd-turbo", torch_dtype=torch.float16,
                                                                 variant="fp16")
@@ -994,6 +1032,7 @@ def main():
                 # latents.requires_grad = True
 
                 prev_t_d = timesteps - 250
+                # prev_t_d *= 0
                 prev_t_d = torch.where(prev_t_d < 0, torch.zeros_like(prev_t_d), prev_t_d)
                 noisy_latents_d = noise_scheduler.add_noise(latents, noise, prev_t_d)
                 c_skip_coop, c_out_coop = scalings_for_boundary_conditions(prev_t_d)
@@ -1008,7 +1047,8 @@ def main():
                         alpha_schedule,
                         sigma_schedule,
                     )
-                    coop_latents = c_skip_coop * noisy_latents_d + c_out_coop * coop_latents
+                    if not args.dont_use_boundary_scalings:
+                        coop_latents = c_skip_coop * noisy_latents_d + c_out_coop * coop_latents
                 D_real = unet_gan(coop_latents, timesteps, encoder_hidden_states, return_dict=False).mean()
                 errD_real = F.softplus(-D_real)
                 D_final_loss = errD_real
@@ -1025,7 +1065,8 @@ def main():
                         alpha_schedule,
                         sigma_schedule,
                     )
-                    fake_latents = c_skip_start * noisy_latents + c_out_start * fake_latents
+                    if not args.dont_use_boundary_scalings:
+                        fake_latents = c_skip_start * noisy_latents + c_out_start * fake_latents
                 D_fake = unet_gan(fake_latents, timesteps, encoder_hidden_states, return_dict=False).mean()
                 errD_fake = F.softplus(D_fake)
                 # accelerator.backward(errD_fake)
@@ -1033,8 +1074,10 @@ def main():
                 D_final_loss += errD_fake
                 accelerator.backward(D_final_loss)
 
-                wandb.log({"D_real": D_real, "D_fake": D_fake, "D_final_loss": D_final_loss,
-                           "errD": errD, "errD_real": errD_real, "errD_fake": errD_fake}, step=step)
+                if accelerator.is_main_process:
+                    wandb.log({"D_real": D_real, "D_fake": D_fake, "D_final_loss": D_final_loss,
+                               "lr": lr_scheduler.get_last_lr()[0],
+                               "errD": errD, "errD_real": errD_real, "errD_fake": errD_fake}, step=step)
 
                 avg_real_loss = accelerator.gather(D_real.repeat(args.train_batch_size)).mean()
                 avg_fake_loss = accelerator.gather(D_fake.repeat(args.train_batch_size)).mean()
@@ -1059,7 +1102,8 @@ def main():
                     alpha_schedule,
                     sigma_schedule,
                 )
-                pred_x_0 = c_skip_start * noisy_latents + c_out_start * pred_x_0
+                if not args.dont_use_boundary_scalings:
+                    pred_x_0 = c_skip_start * noisy_latents + c_out_start * pred_x_0
 
                 args.snr_gamma = 5
                 prev_t = timesteps - 25
@@ -1078,7 +1122,10 @@ def main():
                         alpha_schedule,
                         sigma_schedule,
                     )
-                    target = c_skip * prev_noisy_latents + c_out * prev_pred_x0
+                    if not args.dont_use_boundary_scalings:
+                        target = c_skip * prev_noisy_latents + c_out * prev_pred_x0
+                    else:
+                        target = prev_pred_x0
 
                 snr_sqrt = compute_snr_sqrt(noise_scheduler, timesteps)
                 snr_pre_sqrt = compute_snr_sqrt(noise_scheduler, prev_t)
@@ -1125,10 +1172,10 @@ def main():
 
                 # Backpropagate
                 accelerator.backward(args.lambda_con * loss + args.lambda_kl * kl_loss + errG_gan)
-
-                wandb.log({"loss": loss, "kl_loss": kl_loss, "errG_gan": errG_gan,
-                           "loss_unweighted": loss_unweighted, "kl_loss_unweighted": kl_loss_unweighted,
-                           "total_G_loss": args.lambda_con * loss + args.lambda_kl * kl_loss + errG_gan}, step=step)
+                if accelerator.is_main_process:
+                    wandb.log({"loss": loss, "kl_loss": kl_loss, "errG_gan": errG_gan,
+                               "loss_unweighted": loss_unweighted, "kl_loss_unweighted": kl_loss_unweighted,
+                               "total_G_loss": args.lambda_con * loss + args.lambda_kl * kl_loss + errG_gan}, step=step)
 
                 if accelerator.sync_gradients:
                     accelerator.clip_grad_norm_(unet.parameters(), args.max_grad_norm)
@@ -1158,6 +1205,13 @@ def main():
                             alpha_schedule,
                             sigma_schedule,
                         )
+                        n_steps = 4
+                        with torch.autocast(device_type="cuda", dtype=weight_dtype):
+                            images_pipeline = pipeline(prompt=text_, num_inference_steps=n_steps, guidance_scale=1.0,
+                                                       output_type="pt", return_dict=False, latents=pure_noisy)[0]
+                            images_pipeline_cfg = pipeline(prompt=text_, num_inference_steps=n_steps, guidance_scale=3.0,
+                                                           output_type="pt", return_dict=False, latents=pure_noisy)[0]
+
                         images_noise = \
                             vae.decode(noise_generation.to(vae.dtype) / vae.config.scaling_factor, return_dict=False)[0]
                         images_real = vae.decode(latents.to(vae.dtype) / vae.config.scaling_factor, return_dict=False)[
@@ -1167,6 +1221,10 @@ def main():
                         images_pervt = images_pervt.clamp(-1, 1) * 0.5 + 0.5
                         images_coop = images_coop.clamp(-1, 1) * 0.5 + 0.5
                         images_noise = images_noise.clamp(-1, 1) * 0.5 + 0.5
+                        images_real = images_real.clamp(-1, 1) * 0.5 + 0.5
+                        images_pipeline = images_pipeline.clamp(-1, 1) * 0.5 + 0.5
+                        images_pipeline_cfg = images_pipeline_cfg.clamp(-1, 1) * 0.5 + 0.5
+
                         # save_image(images_t, f'./{args.output_dir}/iamges_t_selfper.jpg', normalize=False, nrow=4)
                         # save_image(images_pervt, f'./{args.output_dir}/images_prevt_selfper.jpg', normalize=False,
                         #            nrow=4)
@@ -1177,12 +1235,18 @@ def main():
                         save_image(images_noise, os.path.join(save_dir, 'singlestep.jpg'), normalize=False, nrow=4)
                         # save_image(images_real.clamp(-1, 1) * 0.5 + 0.5, f'./{args.output_dir}/real_data.jpg',
                         #            normalize=False, nrow=4)
-                        save_image(images_real.clamp(-1, 1) * 0.5 + 0.5, os.path.join(save_dir, 'real_data.jpg'),
+                        save_image(images_real, os.path.join(save_dir, 'real_data.jpg'),
                                    normalize=False, nrow=4)
+                        save_image(images_pipeline, os.path.join(save_dir, 'pipeline.jpg'), normalize=False, nrow=4)
+                        save_image(images_pipeline_cfg, os.path.join(save_dir, 'pipeline_cfg.jpg'), normalize=False,
+                                   nrow=4)
+
                         wandb.log({"images_t": wandb.Image(images_t), "images_pervt": wandb.Image(images_pervt),
                                    "images_coop": wandb.Image(images_coop),
+                                   "images_pipeline": wandb.Image(images_pipeline),
+                                   "images_pipeline_cfg": wandb.Image(images_pipeline_cfg),
                                    "images_singlestep": wandb.Image(images_noise),
-                                   "images_real": wandb.Image(images_real)}, step=step)
+                                   "images_real": wandb.Image(images_real)}, step=global_step)
 
             # Checks if the accelerator has performed an optimization step behind the scenes
             if accelerator.sync_gradients:
@@ -1199,9 +1263,9 @@ def main():
                 global_step += 1
                 accelerator.log({"train_loss": train_loss, "d_real": train_d_real, "d_fake": train_d_fake},
                                 step=global_step)
-
-                wandb.log({"train_loss": train_loss, "d_real": train_d_real, "d_fake": train_d_fake,
-                           }, )
+                if accelerator.is_main_process:
+                    wandb.log({"train_loss": train_loss, "d_real": train_d_real, "d_fake": train_d_fake,
+                               }, )
                 train_loss = 0.0
                 train_d_real = 0.0
                 train_d_fake = 0.0

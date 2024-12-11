@@ -32,6 +32,7 @@ from huggingface_hub import create_repo
 from packaging import version
 from safetensors import safe_open
 from torchvision import transforms
+from torch.nn.parallel import DistributedDataParallel
 from torchvision.utils import save_image
 from tqdm.auto import tqdm
 from transformers import CLIPTextModel, CLIPTokenizer
@@ -40,7 +41,7 @@ from peft import LoraConfig, get_peft_model, get_peft_model_state_dict
 # os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
 from unet import UNet2DConditionModel
 import diffusers
-from diffusers import AutoencoderKL, DDPMScheduler, StableDiffusionPipeline, DDIMScheduler
+from diffusers import AutoencoderKL, DDPMScheduler, StableDiffusionPipeline, DDIMScheduler, EMAModel
 from diffusers.optimization import get_scheduler
 from diffusers.utils import check_min_version, deprecate, is_wandb_available
 from diffusers.utils.import_utils import is_xformers_available
@@ -438,6 +439,12 @@ def parse_args():
         action="store_true",
         help="Whether to use adaptation loss for the v prediction.",
     )
+    parser.add_argument(
+        "--no_lora",
+        action="store_true",
+        help="Whether to use Lora or not."
+    )
+
 
 
     # args = parser.parse_args()
@@ -542,14 +549,6 @@ def main():
                                                     rescale_betas_zero_snr=args.zero_terminal_snr and not args.adapt_zero_terminal_snr,
                                                     prediction_type=args.prediction_type and not args.adapt_v_prediction)
 
-    # noise_scheduler.register_to_config(timestep_spacing="trailing")
-    # if args.zero_terminal_snr:
-    #     noise_scheduler.register_to_config(rescale_betas_zero_snr=True)
-    #     alpha_schedule = torch.sqrt(noise_scheduler.alphas_cumprod.clone())
-    #     alpha_0, alpha_T = alpha_schedule[0], alpha_schedule[-1]
-    #     alpha_schedule = alpha_schedule.clone() - alpha_T
-    #     alpha_schedule = alpha_schedule *  alpha_0 / (alpha_0 - alpha_T)
-    #     noise_scheduler.alphas_cumprod = alpha_schedule ** 2
     alpha_schedule = torch.sqrt(noise_scheduler.alphas_cumprod)
     sigma_schedule = torch.sqrt(1 - noise_scheduler.alphas_cumprod)
     tokenizer = CLIPTokenizer.from_pretrained(
@@ -626,63 +625,56 @@ def main():
     text_encoder.requires_grad_(False)
     unet.train()
     # unet_gan.train()
-    lora_config = LoraConfig(
-        r=64,
-        target_modules=[
-            "to_q",
-            "to_k",
-            "to_v",
-            "to_out.0",
-            "proj_in",
-            "proj_out",
-            "ff.net.0.proj",
-            "ff.net.2",
-            "conv1",
-            "conv2",
-            "conv_shortcut",
-            "downsamplers.0.conv",
-            "upsamplers.0.conv",
-            "time_emb_proj",
-        ],
-    )
-    unet = get_peft_model(unet, lora_config)
-    if args.start_from_checkpoint is not None:
-        if args.start_from_checkpoint.startswith("/artifacts/"):
-            args.start_from_checkpoint = os.path.join(artifacts_path, "/".join(args.start_from_checkpoint.split("/")[2:]))
-
-        state_dict = {}
-        with safe_open(args.start_from_checkpoint, framework="pt", device=0) as f:
-            for k in f.keys():
-                state_dict[k] = f.get_tensor(k)
-
-        def adapt_state_dict(sd):
-            new_state_dict = {}
-            for k, v in sd.items():
-                new_k = ".".join(k.split(".")[:-1] + ['default'] + k.split(".")[-1:])
-                new_state_dict[new_k] = v
-            return new_state_dict
-
-        state_dict = adapt_state_dict(state_dict)
-
-        # Load only the LoRA weights
-        missing_keys, unexpected_keys = unet.load_state_dict(
-            state_dict,
-            strict=False
+    if not args.no_lora:
+        lora_config = LoraConfig(
+            r=64,
+            target_modules=[
+                "to_q",
+                "to_k",
+                "to_v",
+                "to_out.0",
+                "proj_in",
+                "proj_out",
+                "ff.net.0.proj",
+                "ff.net.2",
+                "conv1",
+                "conv2",
+                "conv_shortcut",
+                "downsamplers.0.conv",
+                "upsamplers.0.conv",
+                "time_emb_proj",
+            ],
         )
-        print(f"Loaded checkpoint from {args.start_from_checkpoint}")
-        print(f"Missing keys: {missing_keys}")
-        print(f"Unexpected keys: {unexpected_keys}")
-        print(f"len(missing_keys): {len(missing_keys)}")
-        print(f"first 10 missing keys: {missing_keys[:10]}")
-        print(f"len(unexpected_keys): {len(unexpected_keys)}")
-        print(f"first 10 unexpected keys: {unexpected_keys[:10]}")
-        print(f"Loaded checkpoint from {args.start_from_checkpoint}")
-        # unet.load_adapter(args.start_from_checkpoint, "default", is_trainable=True)
+        unet = get_peft_model(unet, lora_config)
+        if args.start_from_checkpoint is not None:
+            if args.start_from_checkpoint.startswith("/artifacts/"):
+                args.start_from_checkpoint = os.path.join(artifacts_path, "/".join(args.start_from_checkpoint.split("/")[2:]))
+
+            state_dict = {}
+            with safe_open(args.start_from_checkpoint, framework="pt", device=0) as f:
+                for k in f.keys():
+                    state_dict[k] = f.get_tensor(k)
+
+            def adapt_state_dict(sd):
+                new_state_dict = {}
+                for k, v in sd.items():
+                    new_k = ".".join(k.split(".")[:-1] + ['default'] + k.split(".")[-1:])
+                    new_state_dict[new_k] = v
+                return new_state_dict
+
+            state_dict = adapt_state_dict(state_dict)
+
+            # Load only the LoRA weights
+            missing_keys, unexpected_keys = unet.load_state_dict(
+                state_dict,
+                strict=False
+            )
+            # unet.load_adapter(args.start_from_checkpoint, "default", is_trainable=True)
     # ema_lora_state_dict =  get_peft_model_state_dict(unet_, adapter_name="default")
     # unet_gan.unet = get_peft_model(unet_gan.unet, lora_config)
     from copy import deepcopy
     # Create EMA for the unet.
-    if args.use_ema:
+    if args.use_ema and not args.no_lora:
         # dic_lora = get_peft_model_state_dict(unet, adapter_name="default")
         dic_lora = get_module_kohya_state_dict(unet, "lora_unet", torch.float32)
         ema_dic_lora = deepcopy(dic_lora)
@@ -712,17 +704,20 @@ def main():
         def save_model_hook(models, weights, output_dir):
             if accelerator.is_main_process:
                 unet_ = accelerator.unwrap_model(unet)
-                lora_state_dict = get_peft_model_state_dict(unet_, adapter_name="default")
-                StableDiffusionPipeline.save_lora_weights(os.path.join(output_dir, "unet_lora"), lora_state_dict)
-                unet_.save_pretrained(os.path.join(output_dir, "unet"))
-
-                torch.save(ema_dic_lora, os.path.join(output_dir, 'ema_lora.pt'))
+                if args.no_lora:
+                    unet_.save_pretrained(os.path.join(output_dir, "unet"))
+                    if args.use_ema:
+                        ema_unet.save_pretrained(os.path.join(output_dir, "unet_ema"))
+                else:
+                    lora_state_dict = get_peft_model_state_dict(unet_, adapter_name="default")
+                    StableDiffusionPipeline.save_lora_weights(os.path.join(output_dir, "unet_lora"), lora_state_dict)
+                    unet_.save_pretrained(os.path.join(output_dir, "unet"))
+                    if args.use_ema:
+                        torch.save(ema_dic_lora, os.path.join(output_dir, 'ema_lora.pt'))
                 # ema_dic_lora
                 # ema_lora_state_dict = get_peft_model_state_dict(unet_, adapter_name="default")
                 # StableDiffusionPipeline.save_lora_weights(os.path.join(output_dir, "unet_lora_ema"), ema_lora_state_dict)
                 # ema_unet.save_pretrained(os.path.join(output_dir, "unet"))
-                # unet_gan_ = accelerator.unwrap_model(unet_gan)
-                # unet_gan_.save_pretrained(os.path.join(output_dir, "unet_GAN"))
 
                 for i, model in enumerate(models):
                     weights.pop()
@@ -916,6 +911,24 @@ def main():
     )
     # if args.use_ema:
     #     ema_unet.to(accelerator.device)
+
+    from copy import deepcopy
+    # Create EMA for the unet.
+    if args.use_ema and args.no_lora:
+        # dic_lora = get_peft_model_state_dict(unet, adapter_name="default")
+        # dic_lora = get_module_kohya_state_dict(unet, "lora_unet", torch.float32)
+        # ema_dic_lora = deepcopy(dic_lora)
+        # ema_unet = UNet2DConditionModel.from_pretrained(
+        #     args.pretrained_model_name_or_path, subfolder="unet", revision=args.revision, variant=args.variant
+        # )
+        # ema_unet = deepcopy(unet)
+        if isinstance(unet, DistributedDataParallel):
+            ema_unet = deepcopy(unet.module)
+        else:
+            ema_unet = deepcopy(unet)
+        ema_unet = EMAModel(ema_unet.parameters(), model_cls=UNet2DConditionModel, model_config=ema_unet.config,
+                            decay=0.999)
+        # ema_unet = accelerator.prepare_model(ema_unet)
 
     # For mixed precision training we cast all non-trainable weigths (vae, non-lora text_encoder and non-lora unet) to half-precision
     # as these weights are only used for inference, keeping weights in full precision is not required.
@@ -1118,7 +1131,6 @@ def main():
                 )
                 pred_x_0 = c_skip_start * noisy_latents + c_out_start * pred_x_0
 
-
                 args.snr_gamma = 5
                 snr = compute_snr(noise_scheduler, timesteps)
                 real_mse_loss_weights = \
@@ -1195,7 +1207,7 @@ def main():
                             alpha_schedule,
                             sigma_schedule,
                         )
-                        n_steps = 20
+                        n_steps = 25
                         mutlistep_sample = sample_from_model(
                             model=unet,
                             noise_scheduler=noise_scheduler,

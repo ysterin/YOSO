@@ -27,6 +27,7 @@ from accelerate.state import AcceleratorState
 from accelerate.utils import ProjectConfiguration, set_seed
 from huggingface_hub import create_repo
 from packaging import version
+from torch.nn.parallel import DistributedDataParallel
 from torchvision.utils import save_image
 from tqdm.auto import tqdm
 from transformers import CLIPTextModel, CLIPTokenizer
@@ -35,7 +36,7 @@ from peft import LoraConfig, get_peft_model, get_peft_model_state_dict
 
 from unet import UNet2DConditionModel
 import diffusers
-from diffusers import AutoencoderKL, DDPMScheduler, StableDiffusionPipeline
+from diffusers import AutoencoderKL, DDPMScheduler, StableDiffusionPipeline, EMAModel, DDIMScheduler, LCMScheduler
 from diffusers.optimization import get_scheduler
 from diffusers.utils import check_min_version, deprecate, is_wandb_available
 from diffusers.utils.import_utils import is_xformers_available
@@ -77,9 +78,9 @@ def predicted_origin(model_output, timesteps, sample, prediction_type, alphas, s
     return pred_x_0
 
 
-def scalings_for_boundary_conditions(timestep, sigma_data=0.5, timestep_scaling=10.0):
+def scalings_for_boundary_conditions(timestep, sigma_data=1.0, timestep_scaling=10.0):
     c_skip = sigma_data ** 2 / ((timestep / 0.1) ** 2 + sigma_data ** 2)
-    c_out = (timestep / 0.1) / ((timestep / 0.1) ** 2 + sigma_data ** 2) ** 0.5
+    c_out = sigma_data * (timestep / 0.1) / ((timestep / 0.1) ** 2 + sigma_data ** 2) ** 0.5
     return c_skip, c_out
 
 
@@ -388,6 +389,24 @@ def parse_args():
         default=None,
         help="api",
     )
+    parser.add_argument(
+        "--synthetic_data_model",
+        type=str,
+        choices=["sd_turbo", "sdxl_turbo"],
+        default="sd_turbo",
+        help="The model to use for generating synthetic data."
+    )
+    parser.add_argument(
+        "--no_lora",
+        action="store_true",
+        help="Whether to use lora."
+    )
+    parser.add_argument(
+        "--noise_schedule",
+        type=str,
+        default="ddpm",
+        help="The noise schedule to use for the diffusion model. options are ['ddpm', 'ddim', 'lcm']"
+    )
 
     # args = parser.parse_args()
     args, _ = parser.parse_known_args()
@@ -415,6 +434,11 @@ def extract_into_tensor(a, t, x_shape):
 def main():
     args = parse_args()
 
+    data_path = os.getenv("DATA_PATH", "/mnt/data")
+    artifacts_path = os.getenv("ARTIFACTS_PATH", "/mnt/artifacts")
+
+    if args.output_dir.startswith("/artifacts/"):
+        args.output_dir = os.path.join(artifacts_path, "/".join(args.output_dir.split("/")[2:]))
 
     if args.non_ema_revision is not None:
         deprecate(
@@ -461,7 +485,8 @@ def main():
         os.environ['WANDB_API_KEY'] = os.environ.get('WANDB_API_KEY', args.wandb)
         wandb.login(key=args.wandb)
 
-    wandb.init(project=args.tracker_project_name, config=args)
+    if accelerator.is_main_process:
+        wandb.init(project=args.tracker_project_name, config=args)
 
     # Handle the repository creation
     if accelerator.is_main_process:
@@ -474,7 +499,17 @@ def main():
             ).repo_id
 
     # Load scheduler, tokenizer and models.
-    noise_scheduler = DDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
+    if args.noise_schedule == "ddpm":
+        noise_scheduler = DDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler",
+                                                        timestep_spacing="trailing")
+    elif args.noise_schedule == "ddim":
+        noise_scheduler = DDIMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler",
+                                                        timestep_spacing="trailing")
+    elif args.noise_schedule == "lcm":
+        noise_scheduler = LCMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler",
+                                                        timestep_spacing="trailing")
+    else:
+        raise ValueError(f"Invalid noise schedule {args.noise_schedule}.")
     alpha_schedule = torch.sqrt(noise_scheduler.alphas_cumprod)
     sigma_schedule = torch.sqrt(1 - noise_scheduler.alphas_cumprod)
     tokenizer = CLIPTokenizer.from_pretrained(
@@ -547,31 +582,32 @@ def main():
     text_encoder.requires_grad_(False)
     unet.train()
     unet_gan.train()
-    lora_config = LoraConfig(
-        r=64,
-        target_modules=[
-            "to_q",
-            "to_k",
-            "to_v",
-            "to_out.0",
-            "proj_in",
-            "proj_out",
-            "ff.net.0.proj",
-            "ff.net.2",
-            "conv1",
-            "conv2",
-            "conv_shortcut",
-            "downsamplers.0.conv",
-            "upsamplers.0.conv",
-            "time_emb_proj",
-        ],
-    )
-    unet = get_peft_model(unet, lora_config)
+    if not args.no_lora:
+        lora_config = LoraConfig(
+            r=64,
+            target_modules=[
+                "to_q",
+                "to_k",
+                "to_v",
+                "to_out.0",
+                "proj_in",
+                "proj_out",
+                "ff.net.0.proj",
+                "ff.net.2",
+                "conv1",
+                "conv2",
+                "conv_shortcut",
+                "downsamplers.0.conv",
+                "upsamplers.0.conv",
+                "time_emb_proj",
+            ],
+        )
+        unet = get_peft_model(unet, lora_config)
     # ema_lora_state_dict =  get_peft_model_state_dict(unet_, adapter_name="default")
     # unet_gan.unet = get_peft_model(unet_gan.unet, lora_config)
     from copy import deepcopy
     # Create EMA for the unet.
-    if args.use_ema:
+    if args.use_ema and not args.no_lora:
         # dic_lora = get_peft_model_state_dict(unet, adapter_name="default")
         dic_lora = get_module_kohya_state_dict(unet, "lora_unet", torch.float32)
         ema_dic_lora = deepcopy(dic_lora)
@@ -601,41 +637,51 @@ def main():
         def save_model_hook(models, weights, output_dir):
             if accelerator.is_main_process:
                 unet_ = accelerator.unwrap_model(unet)
-                lora_state_dict = get_peft_model_state_dict(unet_, adapter_name="default")
-                StableDiffusionPipeline.save_lora_weights(os.path.join(output_dir, "unet_lora"), lora_state_dict)
-                unet_.save_pretrained(os.path.join(output_dir, "unet"))
-                if args.use_ema:
-                    torch.save(ema_dic_lora, os.path.join(output_dir, 'ema_lora.pt'))
+                if args.no_lora:
+                    unet_.save_pretrained(os.path.join(output_dir, "unet"))
+                    if args.use_ema:
+                        ema_unet.save_pretrained(os.path.join(output_dir, "unet_ema"))
+                else:
+                    lora_state_dict = get_peft_model_state_dict(unet_, adapter_name="default")
+                    StableDiffusionPipeline.save_lora_weights(os.path.join(output_dir, "unet_lora"), lora_state_dict)
+                    unet_.save_pretrained(os.path.join(output_dir, "unet"))
+                    if args.use_ema:
+                        torch.save(ema_dic_lora, os.path.join(output_dir, 'ema_lora.pt'))
                 # ema_dic_lora
                 # ema_lora_state_dict = get_peft_model_state_dict(unet_, adapter_name="default")
                 # StableDiffusionPipeline.save_lora_weights(os.path.join(output_dir, "unet_lora_ema"), ema_lora_state_dict)
                 # ema_unet.save_pretrained(os.path.join(output_dir, "unet"))
-                # unet_gan_ = accelerator.unwrap_model(unet_gan)
-                # unet_gan_.save_pretrained(os.path.join(output_dir, "unet_GAN"))
+                unet_gan_ = accelerator.unwrap_model(unet_gan)
+                unet_gan_.save_pretrained(os.path.join(output_dir, "unet_GAN"))
 
                 for i, model in enumerate(models):
                     weights.pop()
 
         def load_model_hook(models, input_dir):
-            # if args.use_ema:
-            #     load_model = EMAModel.from_pretrained(os.path.join(input_dir, "unet_ema"), UNet2DConditionModel)
-            #     ema_unet.load_state_dict(load_model.state_dict())
-            #     ema_unet.to(accelerator.device)
-            #     del load_model
-            unet_ = accelerator.unwrap_model(unet)
-            unet_.load_adapter(os.path.join(input_dir, "unet"), "default", is_trainable=True)
+            if args.no_lora:
+                if args.use_ema:
+                    load_model = EMAModel.from_pretrained(os.path.join(input_dir, "unet_ema"), UNet2DConditionModel)
+                    ema_unet.load_state_dict(load_model.state_dict())
+                    ema_unet.to(accelerator.device)
+                    del load_model
+                load_model = UNet2DConditionModel.from_pretrained(input_dir, subfolder="unet")
+                unet.load_state_dict(load_model.state_dict())
+                del load_model
+            else:
+                unet_ = accelerator.unwrap_model(unet)
+                unet_.load_adapter(os.path.join(input_dir, "unet"), "default", is_trainable=True)
 
             for i in range(len(models)):
                 # pop models so that they are not loaded again
                 model = models.pop()
-            #     if isinstance(model, My_Dis):
-            #         # save_pth_ = os.path.join(output_dir, "unetGAN")
-            #         # checkpoint = torch.load(os.path.join('unet_gan.pth'))
-            #         # model.load_state_dict(checkpoint)
-            #         load_model = My_Dis.from_pretrained(input_dir, subfolder="unetGAN")
-            #         model.register_to_config(**load_model.config)
-            #         model.load_state_dict(load_model.state_dict())
-            #         del load_model
+                if isinstance(model, My_Dis):
+                    # save_pth_ = os.path.join(output_dir, "unetGAN")
+                    # checkpoint = torch.load(os.path.join('unet_gan.pth'))
+                    # model.load_state_dict(checkpoint)
+                    load_model = My_Dis.from_pretrained(input_dir, subfolder="unet_GAN")
+                    model.register_to_config(**load_model.config)
+                    model.load_state_dict(load_model.state_dict())
+                    del load_model
             #     else:
             #         # load diffusers style into model
             #         load_model = UNet2DConditionModel.from_pretrained(input_dir, subfolder="unet")
@@ -759,6 +805,24 @@ def main():
     # if args.use_ema:
     #     ema_unet.to(accelerator.device)
 
+    from copy import deepcopy
+    # Create EMA for the unet.
+    if args.use_ema and args.no_lora:
+        # dic_lora = get_peft_model_state_dict(unet, adapter_name="default")
+        # dic_lora = get_module_kohya_state_dict(unet, "lora_unet", torch.float32)
+        # ema_dic_lora = deepcopy(dic_lora)
+        # ema_unet = UNet2DConditionModel.from_pretrained(
+        #     args.pretrained_model_name_or_path, subfolder="unet", revision=args.revision, variant=args.variant
+        # )
+        # ema_unet = deepcopy(unet)
+        if isinstance(unet, DistributedDataParallel):
+            ema_unet = deepcopy(unet.module)
+        else:
+            ema_unet = deepcopy(unet)
+        ema_unet = EMAModel(ema_unet.parameters(), model_cls=UNet2DConditionModel, model_config=ema_unet.config,
+                            decay=0.999)
+        # ema_unet = accelerator.prepare_model(ema_unet)
+
     # For mixed precision training we cast all non-trainable weigths (vae, non-lora text_encoder and non-lora unet) to half-precision
     # as these weights are only used for inference, keeping weights in full precision is not required.
     weight_dtype = torch.float32
@@ -860,14 +924,24 @@ def main():
     from diffusers import AutoPipelineForText2Image
     # pipe_sdxl = AutoPipelineForText2Image.from_pretrained("stabilityai/sdxl-turbo", torch_dtype=torch.float16,  variant="fp16")
     # pipe_sdxl.vae = AutoencoderKL.from_pretrained("madebyollin/sdxl-vae-fp16-fix", torch_dtype=torch.float16)
-    pipe_sdxl = AutoPipelineForText2Image.from_pretrained("stabilityai/sd-turbo", vae=vae, torch_dtype=torch.float16,
-                                                          variant="fp16")
-    pipe_sdxl.to(accelerator.device)
-    pipe_sdxl.set_progress_bar_config(disable=True)
-    pipe_sdxl.enable_xformers_memory_efficient_attention()
-    # pipe_sdxl.to(unet.device)
-    # pipe_sdxl.unet.eval()
-    # pipe_sdxl.unet.requires_grad_(False)
+    # # pipe_sdxl = AutoPipelineForText2Image.from_pretrained("stabilityai/sd-turbo", vae=vae, torch_dtype=torch.float16,
+    # #                                                       variant="fp16")
+    # pipe_sdxl.to(accelerator.device)
+    # pipe_sdxl.set_progress_bar_config(disable=True)
+    # pipe_sdxl.enable_xformers_memory_efficient_attention
+    if args.synthetic_data_model == "sd_turbo":
+        pipe_synth = AutoPipelineForText2Image.from_pretrained("stabilityai/sd-turbo", torch_dtype=torch.float16,
+                                                                variant="fp16")
+    elif args.synthetic_data_model == "sdxl_turbo":
+        pipe_synth = AutoPipelineForText2Image.from_pretrained("stabilityai/sdxl-turbo", torch_dtype=torch.float16,
+                                                                variant="fp16")
+        pipe_synth.vae = AutoencoderKL.from_pretrained("madebyollin/sdxl-vae-fp16-fix", torch_dtype=torch.float16)
+    else:
+        raise ValueError("Invalid synthetic data model")
+    pipe_synth.to(accelerator.device)
+    pipe_synth.set_progress_bar_config(disable=True)
+    pipe_synth.enable_xformers_memory_efficient_attention
+
     for epoch in range(first_epoch, args.num_train_epochs):
         train_loss = 0.0
         train_d_real = 0.0
@@ -879,8 +953,17 @@ def main():
                 noise = torch.randn([len(text_), 4, 64, 64])
                 with torch.no_grad():
                     # Generate Data By SD-turbo with 2 steps, instead of use JourneyDB which yeilds the style shift.
-                    latents = pipe_sdxl(prompt=text_, num_inference_steps=4, guidance_scale=1.5, output_type="latent",
-                                        latents=noise.to(pipe_sdxl.unet.dtype))[0]
+                    if args.synthetic_data_model == "sd_turbo":
+                        latents = pipe_synth(prompt=text_, num_inference_steps=4, guidance_scale=1.5, output_type="latent",
+                                            latents=noise.to(pipe_synth.unet.dtype))[0]
+                    elif args.synthetic_data_model == "sdxl_turbo":
+                        images = pipe_synth(prompt=text_, num_inference_steps=4, guidance_scale=1.5, output_type="image",
+                                            latents=noise.to(pipe_synth.unet.dtype))[0]
+                        images = torch.Tensor(images).to(vae.dtype).to(vae.device).permute(0, 3, 1, 2)
+                        latents = vae.encode(images).latent_dist.sample() * vae.config.scaling_factor  # get latent of real data.
+                    else:
+                        raise ValueError("Invalid synthetic data model")
+
                 #     images = pipe_sdxl.vae.decode(latents / pipe_sdxl.vae.config.scaling_factor, return_dict=False)[0].to(weight_dtype).clamp(-1,1)
                 # latents = vae.encode(images).latent_dist.sample()
                 # latents = latents * vae.config.scaling_factor # get latent of real data.
@@ -965,9 +1048,10 @@ def main():
                 D_final_loss += errD_fake
                 accelerator.backward(D_final_loss)
 
-                wandb.log({"D_real": D_real, "D_fake": D_fake, "D_final_loss": D_final_loss,
-                           "lr": lr_scheduler.get_last_lr()[0],
-                           "errD": errD, "errD_real": errD_real, "errD_fake": errD_fake}, step=step)
+                if accelerator.is_main_process:
+                    wandb.log({"D_real": D_real, "D_fake": D_fake, "D_final_loss": D_final_loss,
+                               "lr": lr_scheduler.get_last_lr()[0],
+                               "errD": errD, "errD_real": errD_real, "errD_fake": errD_fake}, step=step)
 
                 avg_real_loss = accelerator.gather(D_real.repeat(args.train_batch_size)).mean()
                 avg_fake_loss = accelerator.gather(D_fake.repeat(args.train_batch_size)).mean()
@@ -1035,7 +1119,7 @@ def main():
                 # loss = F.mse_loss(pred_x_0.float(), target.float(), reduction="none")
                 # print(target_z.shape)
                 loss = F.mse_loss(pred_x0_z.float(), target_z.float(), reduction="none")
-                loss = loss.mean(dim=list(range(1, len(loss.shape)))) # * mse_loss_weights
+                loss = loss.mean(dim=list(range(1, len(loss.shape))))  # * mse_loss_weights
                 loss_unweighted = loss.mean()
                 loss = loss * mse_loss_weights
                 # kl_loss = F.mse_loss(pred_x_0.float(), latents.float(), reduction='none').mean(
@@ -1058,10 +1142,10 @@ def main():
 
                 # Backpropagate
                 accelerator.backward(args.lambda_con * loss + args.lambda_kl * kl_loss + errG_gan)
-
-                wandb.log({"loss": loss, "kl_loss": kl_loss, "errG_gan": errG_gan,
-                           "loss_unweighted": loss_unweighted, "kl_loss_unweighted": kl_loss_unweighted,
-                           "total_G_loss": args.lambda_con * loss + args.lambda_kl * kl_loss + errG_gan}, step=step)
+                if accelerator.is_main_process:
+                    wandb.log({"loss": loss, "kl_loss": kl_loss, "errG_gan": errG_gan,
+                               "loss_unweighted": loss_unweighted, "kl_loss_unweighted": kl_loss_unweighted,
+                               "total_G_loss": args.lambda_con * loss + args.lambda_kl * kl_loss + errG_gan}, step=step)
 
                 if accelerator.sync_gradients:
                     accelerator.clip_grad_norm_(unet.parameters(), args.max_grad_norm)
@@ -1101,6 +1185,7 @@ def main():
                         images_pervt = images_pervt.clamp(-1, 1) * 0.5 + 0.5
                         images_coop = images_coop.clamp(-1, 1) * 0.5 + 0.5
                         images_noise = images_noise.clamp(-1, 1) * 0.5 + 0.5
+                        images_real = images_real.clamp(-1, 1) * 0.5 + 0.5
                         # save_image(images_t, f'./{args.output_dir}/iamges_t_selfper.jpg', normalize=False, nrow=4)
                         # save_image(images_pervt, f'./{args.output_dir}/images_prevt_selfper.jpg', normalize=False,
                         #            nrow=4)
@@ -1111,29 +1196,30 @@ def main():
                         save_image(images_noise, os.path.join(save_dir, 'singlestep.jpg'), normalize=False, nrow=4)
                         # save_image(images_real.clamp(-1, 1) * 0.5 + 0.5, f'./{args.output_dir}/real_data.jpg',
                         #            normalize=False, nrow=4)
-                        save_image(images_real.clamp(-1, 1) * 0.5 + 0.5, os.path.join(save_dir, 'real_data.jpg'),
+                        save_image(images_real, os.path.join(save_dir, 'real_data.jpg'),
                                    normalize=False, nrow=4)
                         wandb.log({"images_t": wandb.Image(images_t), "images_pervt": wandb.Image(images_pervt),
                                    "images_coop": wandb.Image(images_coop),
                                    "images_singlestep": wandb.Image(images_noise),
-                                   "images_real": wandb.Image(images_real)}, step=step)
+                                   "images_real": wandb.Image(images_real)}, step=global_step)
 
             # Checks if the accelerator has performed an optimization step behind the scenes
             if accelerator.sync_gradients:
                 if args.use_ema:
-                    decay = 0.999
-                    unet_ = accelerator.unwrap_model(unet)
-                    dic_lora = get_module_kohya_state_dict(unet_, "lora_unet", torch.float32)
-                    for k, v in dic_lora.items():
-                        ema_dic_lora[k] = decay * deepcopy(ema_dic_lora[k]).to(v.device) + (1 - decay) * (deepcopy(v))
-                    # ema_unet.step(unet.parameters())
+                    if not args.no_lora:
+                        decay = 0.999
+                        unet_ = accelerator.unwrap_model(unet)
+                        dic_lora = get_module_kohya_state_dict(unet_, "lora_unet", torch.float32)
+                        for k, v in dic_lora.items():
+                            ema_dic_lora[k] = decay * deepcopy(ema_dic_lora[k]).to(v.device) + (1 - decay) * (deepcopy(v))
+                    else:
+                        ema_unet.step(unet.parameters())
                 progress_bar.update(1)
                 global_step += 1
                 accelerator.log({"train_loss": train_loss, "d_real": train_d_real, "d_fake": train_d_fake},
                                 step=global_step)
-
-                wandb.log({"train_loss": train_loss, "d_real": train_d_real, "d_fake": train_d_fake,
-                           }, )
+                if accelerator.is_main_process:
+                    wandb.log({"train_loss": train_loss, "d_real": train_d_real, "d_fake": train_d_fake}, )
                 train_loss = 0.0
                 train_d_real = 0.0
                 train_d_fake = 0.0

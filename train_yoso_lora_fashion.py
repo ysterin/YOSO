@@ -41,7 +41,7 @@ from peft import LoraConfig, get_peft_model, get_peft_model_state_dict
 
 from unet import UNet2DConditionModel
 import diffusers
-from diffusers import AutoencoderKL, DDPMScheduler, StableDiffusionPipeline, DDIMScheduler, LCMScheduler
+from diffusers import AutoencoderKL, DDPMScheduler, StableDiffusionPipeline, DDIMScheduler, LCMScheduler, EMAModel
 from diffusers.optimization import get_scheduler
 from diffusers.utils import check_min_version, deprecate, is_wandb_available
 from diffusers.utils.import_utils import is_xformers_available
@@ -83,9 +83,9 @@ def predicted_origin(model_output, timesteps, sample, prediction_type, alphas, s
     return pred_x_0
 
 
-def scalings_for_boundary_conditions(timestep, sigma_data=0.5, timestep_scaling=10.0):
+def scalings_for_boundary_conditions(timestep, sigma_data=1.0, timestep_scaling=10.0):
     c_skip = sigma_data ** 2 / ((timestep / 0.1) ** 2 + sigma_data ** 2)
-    c_out = (timestep / 0.1) / ((timestep / 0.1) ** 2 + sigma_data ** 2) ** 0.5
+    c_out = sigma_data * (timestep / 0.1) / ((timestep / 0.1) ** 2 + sigma_data ** 2) ** 0.5
     return c_skip, c_out
 
 
@@ -415,6 +415,11 @@ def parse_args():
         default=0,
         help="Number of steps for adaptive annealing.",
     )
+    parser.add_argument(
+        "--no_lora",
+        action="store_true",
+        help="Whether to use Lora or not."
+    )
 
     # args = parser.parse_args()
     args, _ = parser.parse_known_args()
@@ -528,18 +533,6 @@ def main():
                                                     rescale_betas_zero_snr=args.zero_terminal_snr,
                                                     prediction_type=args.prediction_type)
 
-
-    # if args.prediction_type is not None:
-    #     # set prediction_type of scheduler if defined
-    #     noise_scheduler.register_to_config(prediction_type=args.prediction_type)
-
-    # if args.zero_terminal_snr:
-    #     noise_scheduler.register_to_config(rescale_betas_zero_snr=True)
-    #     alpha_schedule = torch.sqrt(noise_scheduler.alphas_cumprod.clone())
-    #     alpha_0, alpha_T = alpha_schedule[0], alpha_schedule[-1]
-    #     alpha_schedule = alpha_schedule.clone() - alpha_T
-    #     alpha_schedule = alpha_schedule *  alpha_0 / (alpha_0 - alpha_T)
-    #     noise_scheduler.alphas_cumprod = alpha_schedule ** 2
     alpha_schedule = torch.sqrt(noise_scheduler.alphas_cumprod)
     sigma_schedule = torch.sqrt(1 - noise_scheduler.alphas_cumprod)
     tokenizer = CLIPTokenizer.from_pretrained(
@@ -618,67 +611,68 @@ def main():
     text_encoder.requires_grad_(False)
     unet.train()
     unet_gan.train()
-    lora_config = LoraConfig(
-        r=64,
-        target_modules=[
-            "to_q",
-            "to_k",
-            "to_v",
-            "to_out.0",
-            "proj_in",
-            "proj_out",
-            "ff.net.0.proj",
-            "ff.net.2",
-            "conv1",
-            "conv2",
-            "conv_shortcut",
-            "downsamplers.0.conv",
-            "upsamplers.0.conv",
-            "time_emb_proj",
-        ],
-    )
-    # unet.load_attn_procs(
-    #     "/mnt/artifacts/yoso/tmp/sd-2-1-checkpoint-adapt-ztsnr/checkpoint-42000/unet_lora/pytorch_lora_weights.safetensors")
-    unet = get_peft_model(unet, lora_config)
-    if args.start_from_checkpoint is not None:
-        # if args.start_from_checkpoint.startswith("/artifacts/"):
-        #     args.start_from_checkpoint = os.path.join(artifacts_path,
-        #                                               "/".join(args.start_from_checkpoint.split("/")[2:]))
-
-        state_dict = {}
-        with safe_open(args.start_from_checkpoint, framework="pt", device=0) as f:
-            for k in f.keys():
-                state_dict[k] = f.get_tensor(k)
-
-        def adapt_state_dict(sd):
-            new_state_dict = {}
-            for k, v in sd.items():
-                new_k = ".".join(k.split(".")[:-1] + ['default'] + k.split(".")[-1:])
-                new_state_dict[new_k] = v
-            return new_state_dict
-
-        state_dict = adapt_state_dict(state_dict)
-
-        # Load only the LoRA weights
-        missing_keys, unexpected_keys = unet.load_state_dict(
-            state_dict,
-            strict=False
+    if not args.no_lora:
+        lora_config = LoraConfig(
+            r=64,
+            target_modules=[
+                "to_q",
+                "to_k",
+                "to_v",
+                "to_out.0",
+                "proj_in",
+                "proj_out",
+                "ff.net.0.proj",
+                "ff.net.2",
+                "conv1",
+                "conv2",
+                "conv_shortcut",
+                "downsamplers.0.conv",
+                "upsamplers.0.conv",
+                "time_emb_proj",
+            ],
         )
-        print(f"Loaded checkpoint from {args.start_from_checkpoint}")
-        print(f"Missing keys: {missing_keys}")
-        print(f"Unexpected keys: {unexpected_keys}")
-        print(f"len(missing_keys): {len(missing_keys)}")
-        print(f"first 10 missing keys: {missing_keys[:10]}")
-        print(f"len(unexpected_keys): {len(unexpected_keys)}")
-        print(f"first 10 unexpected keys: {unexpected_keys[:10]}")
-        print(f"Loaded checkpoint from {args.start_from_checkpoint}")
-        # unet.load_adapter(args.start_from_checkpoint, "default", is_trainable=True)
+        # unet.load_attn_procs(
+        #     "/mnt/artifacts/yoso/tmp/sd-2-1-checkpoint-adapt-ztsnr/checkpoint-42000/unet_lora/pytorch_lora_weights.safetensors")
+        unet = get_peft_model(unet, lora_config)
+        if args.start_from_checkpoint is not None:
+            # if args.start_from_checkpoint.startswith("/artifacts/"):
+            #     args.start_from_checkpoint = os.path.join(artifacts_path,
+            #                                               "/".join(args.start_from_checkpoint.split("/")[2:]))
+
+            state_dict = {}
+            with safe_open(args.start_from_checkpoint, framework="pt", device=0) as f:
+                for k in f.keys():
+                    state_dict[k] = f.get_tensor(k)
+
+            def adapt_state_dict(sd):
+                new_state_dict = {}
+                for k, v in sd.items():
+                    new_k = ".".join(k.split(".")[:-1] + ['default'] + k.split(".")[-1:])
+                    new_state_dict[new_k] = v
+                return new_state_dict
+
+            state_dict = adapt_state_dict(state_dict)
+
+            # Load only the LoRA weights
+            missing_keys, unexpected_keys = unet.load_state_dict(
+                state_dict,
+                strict=False
+            )
+            print(f"Loaded checkpoint from {args.start_from_checkpoint}")
+            print(f"Missing keys: {missing_keys}")
+            print(f"Unexpected keys: {unexpected_keys}")
+            print(f"len(missing_keys): {len(missing_keys)}")
+            print(f"first 10 missing keys: {missing_keys[:10]}")
+            print(f"len(unexpected_keys): {len(unexpected_keys)}")
+            print(f"first 10 unexpected keys: {unexpected_keys[:10]}")
+            print(f"Loaded checkpoint from {args.start_from_checkpoint}")
+            # unet.load_adapter(args.start_from_checkpoint, "default", is_trainable=True)
 
     # ema_lora_state_dict =  get_peft_model_state_dict(unet_, adapter_name="default")
     # unet_gan.unet = get_peft_model(unet_gan.unet, lora_config)
     from copy import deepcopy
     # Create EMA for the unet.
-    if args.use_ema:
+    if args.use_ema and not args.no_lora:
         # dic_lora = get_peft_model_state_dict(unet, adapter_name="default")
         dic_lora = get_module_kohya_state_dict(unet, "lora_unet", torch.float32)
         ema_dic_lora = deepcopy(dic_lora)
@@ -708,11 +702,16 @@ def main():
         def save_model_hook(models, weights, output_dir):
             if accelerator.is_main_process:
                 unet_ = accelerator.unwrap_model(unet)
-                lora_state_dict = get_peft_model_state_dict(unet_, adapter_name="default")
-                StableDiffusionPipeline.save_lora_weights(os.path.join(output_dir, "unet_lora"), lora_state_dict)
-                unet_.save_pretrained(os.path.join(output_dir, "unet"))
-
-                torch.save(ema_dic_lora, os.path.join(output_dir, 'ema_lora.pt'))
+                if args.no_lora:
+                    unet_.save_pretrained(os.path.join(output_dir, "unet"))
+                    if args.use_ema:
+                        ema_unet.save_pretrained(os.path.join(output_dir, "unet_ema"))
+                else:
+                    lora_state_dict = get_peft_model_state_dict(unet_, adapter_name="default")
+                    StableDiffusionPipeline.save_lora_weights(os.path.join(output_dir, "unet_lora"), lora_state_dict)
+                    unet_.save_pretrained(os.path.join(output_dir, "unet"))
+                    if args.use_ema:
+                        torch.save(ema_dic_lora, os.path.join(output_dir, 'ema_lora.pt'))
                 # ema_dic_lora
                 # ema_lora_state_dict = get_peft_model_state_dict(unet_, adapter_name="default")
                 # StableDiffusionPipeline.save_lora_weights(os.path.join(output_dir, "unet_lora_ema"), ema_lora_state_dict)
@@ -724,8 +723,20 @@ def main():
                     weights.pop()
 
         def load_model_hook(models, input_dir):
-            unet_ = accelerator.unwrap_model(unet)
-            unet_.load_adapter(os.path.join(input_dir, "unet"), "default", is_trainable=True)
+            if args.no_lora:
+                if args.use_ema:
+                    load_model = EMAModel.from_pretrained(os.path.join(input_dir, "unet_ema"), UNet2DConditionModel)
+                    ema_unet.load_state_dict(load_model.state_dict())
+                    ema_unet.to(accelerator.device)
+                    del load_model
+                load_model = UNet2DConditionModel.from_pretrained(input_dir, subfolder="unet")
+                unet_ = accelerator.unwrap_model(unet)
+                unet_.load_state_dict(load_model.state_dict())
+                # unet.load_state_dict(load_model.state_dict())
+                del load_model
+            else:
+                unet_ = accelerator.unwrap_model(unet)
+                unet_.load_adapter(os.path.join(input_dir, "unet"), "default", is_trainable=True)
 
             for i in range(len(models)):
                 # pop models so that they are not loaded again
@@ -824,12 +835,16 @@ def main():
     class CustomImagePromptDataset(Dataset):
         def __init__(self, root_dir, frames_dirname="frames", annots_file_name="txts_flash_yoso.json", transform=None):
             # self.data = []
+            if transform is None:
+                transform = transforms.Compose([
+                    transforms.Resize((args.resolution, args.resolution)),
+                    transforms.ToTensor(),
+                    transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
+                ])
             self.transform = transform
             self.tokenizer = CLIPTokenizer.from_pretrained(
                 'runwayml/stable-diffusion-v1-5', subfolder="tokenizer", )
             self.root_dir = root_dir
-            # self.subdirs = [d for d in os.listdir(root_dir) if os.path.isdir(os.path.join(root_dir, d)) and
-            #                 os.path.isfile(os.path.join(root_dir, d, annots_file_name))]
             self.annots_files = glob.glob(os.path.join(root_dir, "*", annots_file_name))
             self.file_paths = []
             self.annots_dict = {}
@@ -844,12 +859,6 @@ def main():
                             continue
                         self.annots_dict[file_path] = annot
                         self.file_paths.append(file_path)
-
-            # with open(jsonl_file, 'r') as file:
-            #     for line in file:
-            #         entry = json.loads(line)
-            #         self.data.append(entry['prompt'])
-
         def __len__(self):
             return len(self.file_paths)
 
@@ -862,8 +871,6 @@ def main():
             image = ImageOps.pad(image, (args.resolution, args.resolution))
             if self.transform:
                 image = self.transform(image)
-            # image = torch.tensor(np.array(image)).permute(2, 0, 1)
-            # image = (image.float() / 255.0) * 2.0 - 1.0
 
             return text, prompt, image
 
@@ -880,6 +887,21 @@ def main():
 
     dataset = CustomImagePromptDataset(root_dir=f"{data_path}/fashion/feb/shops/fashion-shops-plus-size-unfiltered",
                                        transform=transform)
+
+    paths = ["fashion/fashion-shops",
+             "fashion/fashion-shops-jul/fashion/fashion-shops-mini",
+             "fashion/fashion-shops-jul/fashion/fashion-shops-random",
+             "fashion/fashion-data-control/retrival_frames/frames",
+             "fashion/pexels/download",
+             "fashion/jul/shops/fashion-shops-plus-size-new",
+             "fashion/feb/shops/fashion-shops-plus-size-unfiltered"]
+
+    paths = [f"{data_path}/{path}" for path in paths]
+
+    dsets = [CustomImagePromptDataset(root_dir=path, transform=transform) for path in paths]
+
+    for i in range(len(dsets)):
+        print(f"Dataset {i} length: {len(dsets[i])} - path: {paths[i]}")
 
     # DataLoaders creation:
     train_dataloader = torch.utils.data.DataLoader(
@@ -914,6 +936,24 @@ def main():
     )
     # if args.use_ema:
     #     ema_unet.to(accelerator.device)
+
+    from copy import deepcopy
+    # Create EMA for the unet.
+    if args.use_ema and args.no_lora:
+        # dic_lora = get_peft_model_state_dict(unet, adapter_name="default")
+        # dic_lora = get_module_kohya_state_dict(unet, "lora_unet", torch.float32)
+        # ema_dic_lora = deepcopy(dic_lora)
+        # ema_unet = UNet2DConditionModel.from_pretrained(
+        #     args.pretrained_model_name_or_path, subfolder="unet", revision=args.revision, variant=args.variant
+        # )
+        # ema_unet = deepcopy(unet)
+        if isinstance(unet, DistributedDataParallel):
+            ema_unet = deepcopy(unet.module)
+        else:
+            ema_unet = deepcopy(unet)
+        ema_unet = EMAModel(ema_unet.parameters(), model_cls=UNet2DConditionModel, model_config=ema_unet.config,
+                            decay=0.999)
+        # ema_unet = accelerator.prepare_model(ema_unet)
 
     # For mixed precision training we cast all non-trainable weigths (vae, non-lora text_encoder and non-lora unet) to half-precision
     # as these weights are only used for inference, keeping weights in full precision is not required.
@@ -995,8 +1035,8 @@ def main():
             if accelerator.is_main_process:
                 wandb.init(project=args.tracker_project_name, config=args)
                 os.makedirs(args.output_dir, exist_ok=True)
-                with open(os.path.join(args.output_dir, "wandb_run_id.txt"), "w") as f:
-                    f.write(wandb.run.id)
+                # with open(os.path.join(args.output_dir, "wandb_run_id.txt"), "w") as f:
+                #     f.write(wandb.run.id)
 
         elif path.startswith(artifacts_path):
             if not os.path.basename(path).startswith("checkpoint"):
@@ -1023,13 +1063,14 @@ def main():
             # initial_global_step = global_step
             # first_epoch = global_step // num_update_steps_per_epoch
             if accelerator.is_main_process:
-                with open(os.path.join(args.output_dir, "wandb_run_id.txt"), "r") as f:
-                    wandb_run_id = f.read()
-                wandb.init(project=args.tracker_project_name, id=wandb_run_id, resume="must")
-                           # resume_from=f"{wandb_run_id}?_step={global_step}")
-                print(wandb.run.step)
+                wandb.init(project=args.tracker_project_name, config=args)
+                # with open(os.path.join(args.output_dir, "wandb_run_id.txt"), "r") as f:
+                #     wandb_run_id = f.read()
+                # wandb.init(project=args.tracker_project_name, id=wandb_run_id, resume="allow")
+                #            # resume_from=f"{wandb_run_id}?_step={global_step}")
+                # print(wandb.run.step)
 
-            global_step = wandb.run.step
+            # global_step = wandb.run.step
             initial_global_step = global_step
             first_epoch = global_step // num_update_steps_per_epoch
 
@@ -1312,6 +1353,8 @@ def main():
                         images_t = vae.decode(pred_x_0.to(vae.dtype) / vae.config.scaling_factor, return_dict=False)[0]
                         images_pervt = vae.decode(target.to(vae.dtype) / vae.config.scaling_factor, return_dict=False)[
                             0]
+                        images_coop = \
+                        vae.decode(coop_latents.to(vae.dtype) / vae.config.scaling_factor, return_dict=False)[0]
                         # pure_noisy = noise_scheduler.add_noise(latents, noise, T_)
                         pure_noisy = torch.randn_like(latents)
                         noise_pred = unet(pure_noisy, T_,
@@ -1338,6 +1381,7 @@ def main():
                     if accelerator.is_main_process:
                         images_t = images_t.clamp(-1, 1) * 0.5 + 0.5
                         images_pervt = images_pervt.clamp(-1, 1) * 0.5 + 0.5
+                        images_coop = images_coop.clamp(-1, 1) * 0.5 + 0.5
                         images_noise = images_noise.clamp(-1, 1) * 0.5 + 0.5
                         images_pipeline = images_pipeline.clamp(-1, 1) * 0.5 + 0.5
                         images_pipeline_cfg = images_pipeline_cfg.clamp(-1, 1) * 0.5 + 0.5
@@ -1348,6 +1392,7 @@ def main():
                         save_image(images_t, os.path.join(save_dir, 'iamges_t_selfper.jpg'), normalize=False, nrow=4)
                         save_image(images_pervt, os.path.join(save_dir, 'images_prevt_selfper.jpg'), normalize=False,
                                    nrow=4)
+                        save_image(images_coop, os.path.join(save_dir, 'images_coop.jpg'), normalize=False, nrow=4)
                         save_image(images_noise, os.path.join(save_dir, 'singlestep.jpg'), normalize=False, nrow=4)
                         # save_image(images_real.clamp(-1, 1) * 0.5 + 0.5, f'./{args.output_dir}/real_data.jpg',
                         #            normalize=False, nrow=4)
@@ -1358,6 +1403,7 @@ def main():
                                    nrow=4)
 
                         wandb.log({"images_t": wandb.Image(images_t), "images_pervt": wandb.Image(images_pervt),
+                                   "images_coop": wandb.Image(images_coop),
                                    "images_singlestep": wandb.Image(images_noise),
                                    "images_pipeline": wandb.Image(images_pipeline),
                                    "images_pipeline_cfg": wandb.Image(images_pipeline_cfg),
@@ -1367,12 +1413,14 @@ def main():
             # Checks if the accelerator has performed an optimization step behind the scenes
             if accelerator.sync_gradients:
                 if args.use_ema:
-                    decay = 0.999
-                    unet_ = accelerator.unwrap_model(unet)
-                    dic_lora = get_module_kohya_state_dict(unet_, "lora_unet", torch.float32)
-                    for k, v in dic_lora.items():
-                        ema_dic_lora[k] = decay * deepcopy(ema_dic_lora[k]).to(v.device) + (1 - decay) * (deepcopy(v))
-                    # ema_unet.step(unet.parameters())
+                    if not args.no_lora:
+                        decay = 0.999
+                        unet_ = accelerator.unwrap_model(unet)
+                        dic_lora = get_module_kohya_state_dict(unet_, "lora_unet", torch.float32)
+                        for k, v in dic_lora.items():
+                            ema_dic_lora[k] = decay * deepcopy(ema_dic_lora[k]).to(v.device) + (1 - decay) * (deepcopy(v))
+                    else:
+                        ema_unet.step(unet.parameters())
                 progress_bar.update(1)
                 global_step += 1
                 accelerator.log({"train_loss": train_loss, "d_real": train_d_real, "d_fake": train_d_fake},
