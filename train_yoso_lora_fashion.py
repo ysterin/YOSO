@@ -14,16 +14,13 @@
 # See the License for the specific language governing permissions and
 
 import argparse
-import glob
 import logging
 import os
 import shutil
 from pathlib import Path
 import accelerate
-import datasets
-import numpy as np
+# import datasets
 import transformers
-from PIL import Image, ImageOps
 from accelerate import Accelerator
 from accelerate.logging import get_logger
 from accelerate.state import AcceleratorState
@@ -39,11 +36,12 @@ from transformers import CLIPTextModel, CLIPTokenizer
 from transformers.utils import ContextManagers
 from peft import LoraConfig, get_peft_model, get_peft_model_state_dict
 
+from data import CustomImageDataset
 from unet import UNet2DConditionModel
 import diffusers
-from diffusers import AutoencoderKL, DDPMScheduler, StableDiffusionPipeline, DDIMScheduler, LCMScheduler, EMAModel
+from diffusers import AutoencoderKL, StableDiffusionPipeline, LCMScheduler, EMAModel
 from diffusers.optimization import get_scheduler
-from diffusers.utils import check_min_version, deprecate, is_wandb_available
+from diffusers.utils import check_min_version, deprecate
 from diffusers.utils.import_utils import is_xformers_available
 from diffusers.utils.torch_utils import is_compiled_module
 
@@ -481,11 +479,11 @@ def main():
     )
     logger.info(accelerator.state, main_process_only=False)
     if accelerator.is_local_main_process:
-        datasets.utils.logging.set_verbosity_warning()
+        # datasets.utils.logging.set_verbosity_warning()
         transformers.utils.logging.set_verbosity_warning()
         diffusers.utils.logging.set_verbosity_info()
     else:
-        datasets.utils.logging.set_verbosity_error()
+        # datasets.utils.logging.set_verbosity_error()
         transformers.utils.logging.set_verbosity_error()
         diffusers.utils.logging.set_verbosity_error()
 
@@ -808,9 +806,7 @@ def main():
 
     # In distributed training, the load_dataset function guarantees that only one local process can concurrently
     # download the dataset.
-    import json
     import torch
-    from torch.utils.data import Dataset
 
     # class CustomImagePromptDataset(Dataset):
     #     def __init__(self, jsonl_file, transform=None):
@@ -832,47 +828,6 @@ def main():
     #                                 truncation=True, return_tensors="pt").input_ids
     #         return text, prompt
 
-    class CustomImagePromptDataset(Dataset):
-        def __init__(self, root_dir, frames_dirname="frames", annots_file_name="txts_flash_yoso.json", transform=None):
-            # self.data = []
-            if transform is None:
-                transform = transforms.Compose([
-                    transforms.Resize((args.resolution, args.resolution)),
-                    transforms.ToTensor(),
-                    transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
-                ])
-            self.transform = transform
-            self.tokenizer = CLIPTokenizer.from_pretrained(
-                'runwayml/stable-diffusion-v1-5', subfolder="tokenizer", )
-            self.root_dir = root_dir
-            self.annots_files = glob.glob(os.path.join(root_dir, "*", annots_file_name))
-            self.file_paths = []
-            self.annots_dict = {}
-            for annots_file in self.annots_files:
-                folder_name = os.path.basename(os.path.dirname(annots_file))
-                with open(annots_file, 'r') as file:
-                    annots = json.load(file)
-                    for k, v in annots.items():
-                        file_path = os.path.join(root_dir, folder_name, frames_dirname, k)
-                        annot = v[0]["11"]
-                        if not isinstance(annot, str):
-                            continue
-                        self.annots_dict[file_path] = annot
-                        self.file_paths.append(file_path)
-        def __len__(self):
-            return len(self.file_paths)
-
-        def __getitem__(self, idx):
-            file_path = self.file_paths[idx]
-            text = self.annots_dict[file_path]
-            prompt = self.tokenizer([text], max_length=self.tokenizer.model_max_length, padding="max_length",
-                                    truncation=True, return_tensors="pt").input_ids
-            image = Image.open(file_path).convert('RGB')
-            image = ImageOps.pad(image, (args.resolution, args.resolution))
-            if self.transform:
-                image = self.transform(image)
-
-            return text, prompt, image
 
     # Create Dataset
     # dataset = CustomImagePromptDataset(jsonl_file=os.path.join(data_path, 'YOSO/train_anno.jsonl'), transform=None)
@@ -885,8 +840,16 @@ def main():
     # dataset = CustomImagePromptDataset(root_dir=f"{data_path}/fashion/fashion-data-control/retrival_frames/frames",
     #                                    transform=transform)
 
-    dataset = CustomImagePromptDataset(root_dir=f"{data_path}/fashion/feb/shops/fashion-shops-plus-size-unfiltered",
-                                       transform=transform)
+    root_dir = [f"{data_path}/fashion/fashion-shops",
+                   f"{data_path}/fashion/fashion-shops-jul/fashion/fashion-shops-mini",
+                   f"{data_path}/fashion/fashion-shops-jul/fashion/fashion-shops-random",
+                   f"{data_path}/fashion/pexels/download",
+                   f"{data_path}/fashion/jul/shops/fashion-shops-plus-size-new",
+                   f"{data_path}/fashion/feb/shops/fashion-shops-plus-size-unfiltered" ]
+    annots_file_name = "background_txts_flash5.json"
+
+    dataset = CustomImageDataset(root_dir=root_dir, transform=transform, resolution=args.resolution,
+                                 annots_file_name=annots_file_name)
 
     paths = ["fashion/fashion-shops",
              "fashion/fashion-shops-jul/fashion/fashion-shops-mini",
@@ -898,10 +861,10 @@ def main():
 
     paths = [f"{data_path}/{path}" for path in paths]
 
-    dsets = [CustomImagePromptDataset(root_dir=path, transform=transform) for path in paths]
-
-    for i in range(len(dsets)):
-        print(f"Dataset {i} length: {len(dsets[i])} - path: {paths[i]}")
+    # dsets = [CustomImageDataset(root_dir=path, transform=transform) for path in paths]
+    #
+    # for i in range(len(dsets)):
+    #     print(f"Dataset {i} length: {len(dsets[i])} - path: {paths[i]}")
 
     # DataLoaders creation:
     train_dataloader = torch.utils.data.DataLoader(
@@ -1094,7 +1057,6 @@ def main():
     import torch.nn.functional as F
     unet_sd.eval()
     unet_sd.requires_grad_(False)
-    from diffusers import AutoPipelineForText2Image
     # pipe_sdxl = AutoPipelineForText2Image.from_pretrained("stabilityai/sdxl-turbo", torch_dtype=torch.float16,  variant="fp16")
     # pipe_sdxl.vae = AutoencoderKL.from_pretrained("madebyollin/sdxl-vae-fp16-fix", torch_dtype=torch.float16)
     # pipe_sdxl = AutoPipelineForText2Image.from_pretrained("stabilityai/sd-turbo", vae=vae, torch_dtype=torch.float16,
@@ -1225,7 +1187,7 @@ def main():
 
                 if accelerator.is_main_process:
                     wandb.log({"D_real": D_real, "D_fake": D_fake, "D_final_loss": D_final_loss,
-                               "errD": errD, "errD_real": errD_real, "errD_fake": errD_fake}, step=global_step)
+                               "errD": errD, "errD_real": errD_real, "errD_fake": errD_fake}, commit=False)
 
                 avg_real_loss = accelerator.gather(D_real.repeat(args.train_batch_size)).mean()
                 avg_fake_loss = accelerator.gather(D_fake.repeat(args.train_batch_size)).mean()
@@ -1335,7 +1297,7 @@ def main():
                                "annealing_weight": annealing_weight,
                                "total_G_loss": annealing_weight * args.lambda_con * loss +
                                                annealing_weight * args.lambda_kl * kl_loss +
-                                               errG_gan}, step=global_step)
+                                               errG_gan}, commit=False)
                     # "total_G_loss": args.lambda_con * loss + args.lambda_kl * kl_loss + errG_gan}, step=global_step)
 
                 if accelerator.sync_gradients:
@@ -1408,7 +1370,7 @@ def main():
                                    "images_pipeline": wandb.Image(images_pipeline),
                                    "images_pipeline_cfg": wandb.Image(images_pipeline_cfg),
 
-                                   "images_real": wandb.Image(images_real)}, step=global_step)
+                                   "images_real": wandb.Image(images_real)}, commit=False)
 
             # Checks if the accelerator has performed an optimization step behind the scenes
             if accelerator.sync_gradients:
@@ -1428,7 +1390,7 @@ def main():
 
                 if accelerator.is_main_process:
                     wandb.log({"train_loss": train_loss, "d_real": train_d_real, "d_fake": train_d_fake,
-                               }, )
+                               }, commit=False)
                 train_loss = 0.0
                 train_d_real = 0.0
                 train_d_fake = 0.0
@@ -1463,6 +1425,9 @@ def main():
                     "errD": errD.detach().item(), "step_loss": loss.detach().item(),
                     "lr": lr_scheduler.get_last_lr()[0]}
             progress_bar.set_postfix(**logs)
+
+            if accelerator.is_main_process:
+                wandb.log({}, commit=True)
 
             if global_step >= args.max_train_steps:
                 break

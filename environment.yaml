@@ -15,12 +15,9 @@ dependencies:
   - transformers==4.44.2
   - diffusers==0.30.2
   - numpy==1.26.4
-  - gxx_linux-64==12.4.0
-  - gxx_impl_linux-64==12.4.0
-  - pyarrow==16.1.0
   - peft
   - tqdm
   - huggingface_hub
   - wandb
-  - datasets[vision]==3.0.0
+  - datasets[vision]
 

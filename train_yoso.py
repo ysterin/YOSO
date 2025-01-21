@@ -19,7 +19,7 @@ import os
 import shutil
 from pathlib import Path
 import accelerate
-import datasets
+# import datasets
 import matplotlib.pyplot as plt
 import transformers
 from accelerate import Accelerator
@@ -408,6 +408,16 @@ def parse_args():
         default="ddpm",
         help="The noise schedule to use for the diffusion model. options are ['ddpm', 'ddim', 'lcm']"
     )
+    parser.add_argument(
+        "--reuse_noise",
+        action="store_true",
+        help="reuse the same noise that generated the samples as sample noise."
+    )
+    parser.add_argument(
+        "--randomize_disc_timesteps",
+        action="store_true",
+        help="Randomize the timesteps for the discriminator."
+    )
 
     # args = parser.parse_args()
     args, _ = parser.parse_known_args()
@@ -454,11 +464,17 @@ def main():
 
     accelerator_project_config = ProjectConfiguration(project_dir=args.output_dir, logging_dir=logging_dir)
 
+    dynamo_plugin = accelerate.utils.TorchDynamoPlugin(
+        backend=accelerate.utils.DynamoBackend.INDUCTOR,
+        mode='reduce-overhead'
+    )
+
     accelerator = Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         mixed_precision=args.mixed_precision,
         log_with=args.report_to,
         project_config=accelerator_project_config,
+        dynamo_plugin=dynamo_plugin
     )
 
     # Make one log on every process with the configuration for debugging.
@@ -469,11 +485,11 @@ def main():
     )
     logger.info(accelerator.state, main_process_only=False)
     if accelerator.is_local_main_process:
-        datasets.utils.logging.set_verbosity_warning()
+        # datasets.utils.logging.set_verbosity_warning()
         transformers.utils.logging.set_verbosity_warning()
         diffusers.utils.logging.set_verbosity_info()
     else:
-        datasets.utils.logging.set_verbosity_error()
+        # datasets.utils.logging.set_verbosity_error()
         transformers.utils.logging.set_verbosity_error()
         diffusers.utils.logging.set_verbosity_error()
 
@@ -923,13 +939,19 @@ def main():
     # pipe_sdxl.set_progress_bar_config(disable=True)
     # pipe_sdxl.enable_xformers_memory_efficient_attention
     pipeline = StableDiffusionPipeline.from_pretrained(
-        args.pretrained_model_name_or_path, subfolder="pipeline", revision=args.revision, torch_dtype=weight_dtype
+        args.pretrained_model_name_or_path, subfolder="pipeline", revision=args.revision, torch_dtype=weight_dtype,
+        safety_checker=None
     )
     pipeline.to(accelerator.device)
     pipeline.set_progress_bar_config(disable=True)
     pipeline.enable_xformers_memory_efficient_attention()
     pipeline.scheduler = deepcopy(noise_scheduler)
     del pipeline.unet
+    if isinstance(unet, DistributedDataParallel):
+        pipeline.unet = unet.module
+    else:
+        pipeline.unet = unet
+
 
     if args.synthetic_data_model == "sd_turbo":
         pipe_synth = AutoPipelineForText2Image.from_pretrained("stabilityai/sd-turbo", torch_dtype=torch.float16,
@@ -942,7 +964,7 @@ def main():
         raise ValueError("Invalid synthetic data model")
     pipe_synth.to(accelerator.device)
     pipe_synth.set_progress_bar_config(disable=True)
-    pipe_synth.enable_xformers_memory_efficient_attention
+    pipe_synth.enable_xformers_memory_efficient_attention()
 
     for epoch in range(first_epoch, args.num_train_epochs):
         train_loss = 0.0
@@ -997,8 +1019,11 @@ def main():
                     # set prediction_type of scheduler if defined
                     noise_scheduler.register_to_config(prediction_type=args.prediction_type)
 
-                # Sample noise that we'll add to the latents
-                noise = torch.randn_like(latents)
+                if not args.reuse_noise:
+                    # Sample noise that we'll add to the latents
+                    noise = torch.randn_like(latents)
+                else:
+                    noise = noise.to(latents.device)
                 # args.noise_offset = 0.05
                 if args.noise_offset:
                     # https://www.crosslabs.org//blog/diffusion-with-offset-noise
@@ -1011,6 +1036,13 @@ def main():
                 # Sample a random timestep for each image
                 timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device)
                 timesteps = timesteps.long()
+
+                if args.randomize_disc_timesteps:
+                    discriminator_timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,),
+                                                            device=latents.device)
+                    discriminator_timesteps = discriminator_timesteps.long()
+                else:
+                    discriminator_timesteps = timesteps
 
                 # Add noise to the latents according to the noise magnitude at each timestep
                 # (this is the forward diffusion process)
@@ -1049,7 +1081,7 @@ def main():
                     )
                     if not args.dont_use_boundary_scalings:
                         coop_latents = c_skip_coop * noisy_latents_d + c_out_coop * coop_latents
-                D_real = unet_gan(coop_latents, timesteps, encoder_hidden_states, return_dict=False).mean()
+                D_real = unet_gan(coop_latents, discriminator_timesteps, encoder_hidden_states, return_dict=False).mean()
                 errD_real = F.softplus(-D_real)
                 D_final_loss = errD_real
 
@@ -1067,17 +1099,21 @@ def main():
                     )
                     if not args.dont_use_boundary_scalings:
                         fake_latents = c_skip_start * noisy_latents + c_out_start * fake_latents
-                D_fake = unet_gan(fake_latents, timesteps, encoder_hidden_states, return_dict=False).mean()
+                D_fake = unet_gan(fake_latents, discriminator_timesteps, encoder_hidden_states, return_dict=False).mean()
                 errD_fake = F.softplus(D_fake)
                 # accelerator.backward(errD_fake)
                 errD = errD_real + errD_fake
                 D_final_loss += errD_fake
                 accelerator.backward(D_final_loss)
 
-                if accelerator.is_main_process:
-                    wandb.log({"D_real": D_real, "D_fake": D_fake, "D_final_loss": D_final_loss,
-                               "lr": lr_scheduler.get_last_lr()[0],
-                               "errD": errD, "errD_real": errD_real, "errD_fake": errD_fake}, step=step)
+                # if accelerator.is_main_process:
+                #     wandb.log({"D_real": D_real, "D_fake": D_fake, "D_final_loss": D_final_loss,
+                #                "lr": lr_scheduler.get_last_lr()[0],
+                #                "errD": errD, "errD_real": errD_real, "errD_fake": errD_fake},)
+                # accelerator.log({"D_real": D_real, "D_fake": D_fake, "D_final_loss": D_final_loss,
+                #            "lr": lr_scheduler.get_last_lr()[0],
+                #            "errD": errD, "errD_real": errD_real, "errD_fake": errD_fake}, step=global_step)
+
 
                 avg_real_loss = accelerator.gather(D_real.repeat(args.train_batch_size)).mean()
                 avg_fake_loss = accelerator.gather(D_fake.repeat(args.train_batch_size)).mean()
@@ -1163,7 +1199,7 @@ def main():
                 loss = loss.mean()
 
                 # GAN loss
-                output = unet_gan(pred_x_0, timesteps, encoder_hidden_states, return_dict=False).mean()
+                output = unet_gan(pred_x_0, discriminator_timesteps, encoder_hidden_states, return_dict=False).mean()
                 errG_gan = F.softplus(-output).mean()
 
                 # Gather the losses across all processes for logging (if we use distributed training).
@@ -1175,7 +1211,14 @@ def main():
                 if accelerator.is_main_process:
                     wandb.log({"loss": loss, "kl_loss": kl_loss, "errG_gan": errG_gan,
                                "loss_unweighted": loss_unweighted, "kl_loss_unweighted": kl_loss_unweighted,
-                               "total_G_loss": args.lambda_con * loss + args.lambda_kl * kl_loss + errG_gan}, step=step)
+                               "total_G_loss": args.lambda_con * loss + args.lambda_kl * kl_loss + errG_gan,
+                               "D_real": D_real, "D_fake": D_fake, "D_final_loss": D_final_loss,
+                               "lr": lr_scheduler.get_last_lr()[0],
+                               "errD": errD, "errD_real": errD_real, "errD_fake": errD_fake
+                               }, commit=False)
+                # accelerator.log({"loss": loss, "kl_loss": kl_loss, "errG_gan": errG_gan,
+                #            "loss_unweighted": loss_unweighted, "kl_loss_unweighted": kl_loss_unweighted,
+                #            "total_G_loss": args.lambda_con * loss + args.lambda_kl * kl_loss + errG_gan}, step=global_step)
 
                 if accelerator.sync_gradients:
                     accelerator.clip_grad_norm_(unet.parameters(), args.max_grad_norm)
@@ -1246,7 +1289,7 @@ def main():
                                    "images_pipeline": wandb.Image(images_pipeline),
                                    "images_pipeline_cfg": wandb.Image(images_pipeline_cfg),
                                    "images_singlestep": wandb.Image(images_noise),
-                                   "images_real": wandb.Image(images_real)}, step=global_step)
+                                   "images_real": wandb.Image(images_real)}, commit=False)
 
             # Checks if the accelerator has performed an optimization step behind the scenes
             if accelerator.sync_gradients:
@@ -1261,11 +1304,11 @@ def main():
                     ema_unet.step(unet.parameters())
                 progress_bar.update(1)
                 global_step += 1
-                accelerator.log({"train_loss": train_loss, "d_real": train_d_real, "d_fake": train_d_fake},
-                                step=global_step)
+                # accelerator.log({"train_loss": train_loss, "d_real": train_d_real, "d_fake": train_d_fake},
+                #                 step=global_step)
                 if accelerator.is_main_process:
                     wandb.log({"train_loss": train_loss, "d_real": train_d_real, "d_fake": train_d_fake,
-                               }, )
+                               }, commit=False)
                 train_loss = 0.0
                 train_d_real = 0.0
                 train_d_fake = 0.0
@@ -1303,6 +1346,8 @@ def main():
 
             if global_step >= args.max_train_steps:
                 break
+
+            wandb.log({}, commit=True)
     accelerator.end_training()
 
 

@@ -19,7 +19,7 @@ import os
 import shutil
 from pathlib import Path
 import accelerate
-import datasets
+# import datasets
 import transformers
 from accelerate import Accelerator
 from accelerate.logging import get_logger
@@ -407,6 +407,16 @@ def parse_args():
         default="ddpm",
         help="The noise schedule to use for the diffusion model. options are ['ddpm', 'ddim', 'lcm']"
     )
+    parser.add_argument(
+        "--reuse_noise",
+        action="store_true",
+        help="reuse the same noise that generated the samples as sample noise."
+    )
+    parser.add_argument(
+        "--randomize_disc_timesteps",
+        action="store_true",
+        help="Randomize the timesteps for the discriminator."
+    )
 
     # args = parser.parse_args()
     args, _ = parser.parse_known_args()
@@ -468,11 +478,11 @@ def main():
     )
     logger.info(accelerator.state, main_process_only=False)
     if accelerator.is_local_main_process:
-        datasets.utils.logging.set_verbosity_warning()
+        # datasets.utils.logging.set_verbosity_warning()
         transformers.utils.logging.set_verbosity_warning()
         diffusers.utils.logging.set_verbosity_info()
     else:
-        datasets.utils.logging.set_verbosity_error()
+        # datasets.utils.logging.set_verbosity_error()
         transformers.utils.logging.set_verbosity_error()
         diffusers.utils.logging.set_verbosity_error()
 
@@ -940,7 +950,7 @@ def main():
         raise ValueError("Invalid synthetic data model")
     pipe_synth.to(accelerator.device)
     pipe_synth.set_progress_bar_config(disable=True)
-    pipe_synth.enable_xformers_memory_efficient_attention
+    pipe_synth.enable_xformers_memory_efficient_attention()
 
     for epoch in range(first_epoch, args.num_train_epochs):
         train_loss = 0.0
@@ -974,8 +984,9 @@ def main():
                     # set prediction_type of scheduler if defined
                     noise_scheduler.register_to_config(prediction_type=args.prediction_type)
 
-                # Sample noise that we'll add to the latents
-                noise = torch.randn_like(latents)
+                if not args.reuse_noise:
+                    # Sample noise that we'll add to the latents
+                    noise = torch.randn_like(latents)
                 # args.noise_offset = 0.05
                 if args.noise_offset:
                     # https://www.crosslabs.org//blog/diffusion-with-offset-noise
@@ -988,6 +999,13 @@ def main():
                 # Sample a random timestep for each image
                 timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device)
                 timesteps = timesteps.long()
+
+                if args.randomize_disc_timesteps:
+                    discriminator_timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,),
+                                                            device=latents.device)
+                    discriminator_timesteps = discriminator_timesteps.long()
+                else:
+                    discriminator_timesteps = timesteps
 
                 # Add noise to the latents according to the noise magnitude at each timestep
                 # (this is the forward diffusion process)
@@ -1024,7 +1042,7 @@ def main():
                         sigma_schedule,
                     )
                     coop_latents = c_skip_coop * noisy_latents_d + c_out_coop * coop_latents
-                D_real = unet_gan(coop_latents, timesteps, encoder_hidden_states, return_dict=False).mean()
+                D_real = unet_gan(coop_latents, discriminator_timesteps, encoder_hidden_states, return_dict=False).mean()
                 errD_real = F.softplus(-D_real)
                 D_final_loss = errD_real
 
@@ -1041,7 +1059,7 @@ def main():
                         sigma_schedule,
                     )
                     fake_latents = c_skip_start * noisy_latents + c_out_start * fake_latents
-                D_fake = unet_gan(fake_latents, timesteps, encoder_hidden_states, return_dict=False).mean()
+                D_fake = unet_gan(fake_latents, discriminator_timesteps, encoder_hidden_states, return_dict=False).mean()
                 errD_fake = F.softplus(D_fake)
                 # accelerator.backward(errD_fake)
                 errD = errD_real + errD_fake
@@ -1133,7 +1151,7 @@ def main():
                 loss = loss.mean()
 
                 # GAN loss
-                output = unet_gan(pred_x_0, timesteps, encoder_hidden_states, return_dict=False).mean()
+                output = unet_gan(pred_x_0, discriminator_timesteps, encoder_hidden_states, return_dict=False).mean()
                 errG_gan = F.softplus(-output).mean()
 
                 # Gather the losses across all processes for logging (if we use distributed training).
